@@ -22,6 +22,15 @@ function loadTestApi() {
   return sandbox.__BDF_TEST_EXPORTS__;
 }
 
+function readScriptMetadata(source) {
+  return Object.fromEntries(
+    Array.from(source.matchAll(/^\/\/\s+@(\S+)\s+(.+)$/gm), ([, key, value]) => [
+      key,
+      value.trim(),
+    ]),
+  );
+}
+
 test('parses keywords, comments, and regular expressions', () => {
   const { parseRules } = loadTestApi();
   const result = parseRules(`
@@ -119,4 +128,73 @@ test('shows the status panel only for an active filter with rules', () => {
     shouldShowStatusPanel({ enabled: true, showStatusPanel: true }, 0),
     false,
   );
+});
+
+test('extracts text from forwarded and opus dynamic content', () => {
+  const { contentSelector, extractCardText } = loadTestApi();
+  const forwardedText = { innerText: '转发内容中的推广关键字' };
+  const card = {
+    querySelectorAll(selector) {
+      assert.equal(selector, contentSelector);
+      return [forwardedText];
+    },
+  };
+
+  assert.match(contentSelector, /\.bili-dyn-content__forw__desc/);
+  assert.match(contentSelector, /\.dyn-card-opus__summary/);
+  assert.equal(extractCardText(card), '转发内容中的推广关键字');
+});
+
+test('does not duplicate text from nested content selectors', () => {
+  const { extractCardText } = loadTestApi();
+  const child = { innerText: '推广内容' };
+  const parent = {
+    innerText: '推广内容',
+    contains(node) {
+      return node === child;
+    },
+  };
+  const card = {
+    querySelectorAll() {
+      return [parent, child];
+    },
+  };
+
+  assert.equal(extractCardText(card), '推广内容');
+});
+
+test('publishes a metadata endpoint and a legacy update bridge', () => {
+  const scriptPath = path.join(
+    __dirname,
+    '..',
+    'scripts',
+    'bilibili',
+    'bilibili-dynamic-filter.user.js',
+  );
+  const metadataPath = path.join(
+    __dirname,
+    '..',
+    'scripts',
+    'bilibili',
+    'bilibili-dynamic-filter.meta.js',
+  );
+  const legacyPath = path.join(
+    __dirname,
+    '..',
+    'scripts',
+    'bilibili-dynamic-filter.user.js',
+  );
+  const source = fs.readFileSync(scriptPath, 'utf8');
+  const metadataSource = fs.readFileSync(metadataPath, 'utf8');
+  const legacySource = fs.readFileSync(legacyPath, 'utf8');
+  const scriptMetadata = readScriptMetadata(source);
+  const updateMetadata = readScriptMetadata(metadataSource);
+
+  assert.equal(
+    scriptMetadata.updateURL,
+    'https://raw.githubusercontent.com/BlackCCCat/TampermonkeyScripts/main/scripts/bilibili/bilibili-dynamic-filter.meta.js',
+  );
+  assert.equal(updateMetadata.version, scriptMetadata.version);
+  assert.equal(updateMetadata.downloadURL, scriptMetadata.downloadURL);
+  assert.equal(legacySource, source);
 });

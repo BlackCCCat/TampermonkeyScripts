@@ -4,7 +4,7 @@
 
 ## 哔哩哔哩动态关键字屏蔽
 
-脚本文件：[scripts/bilibili/bilibili-dynamic-filter.user.js](scripts/bilibili/bilibili-dynamic-filter.user.js)
+脚本文件：[bilibili-dynamic-filter.user.js](bilibili-dynamic-filter.user.js)
 
 支持页面：
 
@@ -28,6 +28,12 @@
    ```
 
 7. 命中的动态会被隐藏；启用状态显示后，页面右下角会显示屏蔽数量和操作按钮。
+
+### 自动更新
+
+- `bilibili-dynamic-filter.meta.js` 只提供版本元数据，Tampermonkey 通过它检查更新；发现新版本后，再从 `bilibili-dynamic-filter.user.js` 下载完整脚本。
+- `scripts/bilibili-dynamic-filter.user.js` 是旧版错误更新地址的兼容桥接文件。已经安装旧版本的用户在更新到 `0.2.1` 后，会自动切换到新的元数据地址。
+- 如果仍无法检查更新，请确认 Tampermonkey 中该脚本的“检查更新”选项以及扩展的全局更新间隔没有被关闭。
 
 ### 状态面板
 
@@ -55,4 +61,4 @@ npm test
 npm run check
 ```
 
-自动化测试覆盖规则解析、非法正则、大小写、全局正则重复匹配、转义斜杠、空白归一化、旧配置迁移和状态面板显示条件。页面 DOM 选择器与原位预览仍需在已登录的哔哩哔哩页面进行人工验证；如果哔哩哔哩调整页面结构，可更新脚本中的 `CARD_SELECTOR` 和 `CONTENT_SELECTOR`。
+自动化测试覆盖规则解析、非法正则、大小写、全局正则重复匹配、转义斜杠、空白归一化、转发动态文本、旧配置迁移、状态面板显示条件和自动更新元数据链路。页面 DOM 选择器与原位预览仍需在已登录的哔哩哔哩页面进行人工验证；如果哔哩哔哩调整页面结构，可更新脚本中的 `CARD_SELECTOR` 和 `CONTENT_SELECTOR`。
