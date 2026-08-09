@@ -1,0 +1,19 @@
+{
+  "name": "tampermonkey-scripts",
+  "version": "0.1.0",
+  "private": true,
+  "author": "BlackCCCat",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BlackCCCat/TampermonkeyScripts.git"
+  },
+  "homepage": "https://github.com/BlackCCCat/TampermonkeyScripts",
+  "bugs": {
+    "url": "https://github.com/BlackCCCat/TampermonkeyScripts/issues"
+  },
+  "scripts": {
+    "check": "node --check scripts/bilibili-dynamic-filter.user.js",
+    "test": "node --test"
+  }
+}
