@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.1.0
+// @version      0.2.0
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
 // @homepageURL  https://github.com/BlackCCCat/TampermonkeyScripts
 // @supportURL   https://github.com/BlackCCCat/TampermonkeyScripts/issues
-// @downloadURL  https://raw.githubusercontent.com/BlackCCCat/TampermonkeyScripts/main/scripts/bilibili-dynamic-filter.user.js
-// @updateURL    https://raw.githubusercontent.com/BlackCCCat/TampermonkeyScripts/main/scripts/bilibili-dynamic-filter.user.js
+// @downloadURL  https://raw.githubusercontent.com/BlackCCCat/TampermonkeyScripts/main/scripts/bilibili/bilibili-dynamic-filter.user.js
+// @updateURL    https://raw.githubusercontent.com/BlackCCCat/TampermonkeyScripts/main/scripts/bilibili/bilibili-dynamic-filter.user.js
 // @match        https://t.bilibili.com/*
 // @match        https://space.bilibili.com/*/dynamic*
 // @icon         https://www.bilibili.com/favicon.ico
@@ -23,7 +23,29 @@
 (function () {
   'use strict';
 
+  const DEFAULT_CONFIG = Object.freeze({
+    enabled: true,
+    rulesText: '',
+    showStatusPanel: true,
+  });
   const normalizeText = (text) => String(text ?? '').replace(/\s+/g, ' ').trim();
+
+  function normalizeConfig(stored) {
+    if (!stored || typeof stored !== 'object') return { ...DEFAULT_CONFIG };
+    return {
+      enabled: stored.enabled !== false,
+      rulesText: typeof stored.rulesText === 'string' ? stored.rulesText : '',
+      showStatusPanel: stored.showStatusPanel !== false,
+    };
+  }
+
+  function shouldShowStatusPanel(currentConfig, ruleCount) {
+    return (
+      currentConfig.enabled &&
+      currentConfig.showStatusPanel &&
+      ruleCount > 0
+    );
+  }
 
   function findRegexClosingSlash(line) {
     for (let index = line.length - 1; index > 0; index -= 1) {
@@ -104,12 +126,17 @@
   }
 
   if (globalThis.__BDF_TEST_MODE__) {
-    globalThis.__BDF_TEST_EXPORTS__ = { findMatch, normalizeText, parseRules };
+    globalThis.__BDF_TEST_EXPORTS__ = {
+      findMatch,
+      normalizeConfig,
+      normalizeText,
+      parseRules,
+      shouldShowStatusPanel,
+    };
     return;
   }
 
   const CONFIG_KEY = 'bilibili-dynamic-filter:config:v1';
-  const DEFAULT_CONFIG = Object.freeze({ enabled: true, rulesText: '' });
   const CARD_SELECTOR = [
     '.bili-dyn-list__item',
     '.bili-dyn-item',
@@ -125,29 +152,31 @@
     '.bili-dyn-card-reserve__title',
   ].join(',');
   const HIDDEN_CLASS = 'bdf-hidden-dynamic';
+  const PREVIEW_CLASS = 'bdf-show-blocked-content';
+  const OWNED_UI_SELECTOR = '#bdf-status, #bdf-overlay';
 
   let config = loadConfig();
   let parsedRules = parseRules(config.rulesText).rules;
   let configRevision = 0;
   let pendingTimer;
-  let statsButton;
+  let showBlockedContent = false;
+  let statusPanel;
+  let statusCount;
+  let previewButton;
+  let closeConfigDialog = null;
   const pendingRoots = new Set();
   const cardState = new WeakMap();
 
   function loadConfig() {
-    const stored = GM_getValue(CONFIG_KEY, DEFAULT_CONFIG);
-    if (!stored || typeof stored !== 'object') return { ...DEFAULT_CONFIG };
-    return {
-      enabled: stored.enabled !== false,
-      rulesText: typeof stored.rulesText === 'string' ? stored.rulesText : '',
-    };
+    return normalizeConfig(GM_getValue(CONFIG_KEY, DEFAULT_CONFIG));
   }
 
   function saveConfig(nextConfig) {
-    config = nextConfig;
+    config = normalizeConfig(nextConfig);
     parsedRules = parseRules(config.rulesText).rules;
     configRevision += 1;
     GM_setValue(CONFIG_KEY, config);
+    setBlockedContentPreview(false, false);
     scanRoot(document.body);
     updateStats();
   }
@@ -185,11 +214,18 @@
 
     if (!match) {
       card.classList.remove(HIDDEN_CLASS);
+      card.style.removeProperty('--bdf-original-display');
       card.removeAttribute('data-bdf-rule');
       card.removeAttribute('data-bdf-rule-type');
       return;
     }
 
+    if (!card.classList.contains(HIDDEN_CLASS)) {
+      const originalDisplay = getComputedStyle(card).display;
+      if (originalDisplay !== 'none') {
+        card.style.setProperty('--bdf-original-display', originalDisplay);
+      }
+    }
     card.classList.add(HIDDEN_CLASS);
     card.dataset.bdfRule = match.source;
     card.dataset.bdfRuleType = match.type;
@@ -212,6 +248,7 @@
 
   function queueScan(root) {
     if (!(root instanceof Element)) return;
+    if (root.closest(OWNED_UI_SELECTOR)) return;
 
     const scanTarget = canonicalCard(root) || root;
     for (const pendingRoot of pendingRoots) {
@@ -255,21 +292,56 @@
   }
 
   function updateStats() {
-    if (!statsButton) return;
-    const hiddenCount = document.querySelectorAll(`.${HIDDEN_CLASS}`).length;
-    const label = `已屏蔽 ${hiddenCount} 条动态 · 配置`;
-    if (statsButton.textContent !== label) statsButton.textContent = label;
-    const shouldHide = hiddenCount === 0;
-    if (statsButton.hidden !== shouldHide) statsButton.hidden = shouldHide;
+    if (!statusPanel) return;
+
+    const hiddenCards = document.querySelectorAll(`.${HIDDEN_CLASS}`);
+    const hiddenCount = hiddenCards.length;
+    if (hiddenCount === 0 && showBlockedContent) {
+      showBlockedContent = false;
+      document.documentElement.classList.remove(PREVIEW_CLASS);
+    }
+
+    const panelVisible = shouldShowStatusPanel(config, parsedRules.length);
+    statusPanel.hidden = !panelVisible;
+    statusCount.textContent = `已屏蔽 ${hiddenCount} 条动态`;
+    previewButton.disabled = hiddenCount === 0;
+    previewButton.textContent = showBlockedContent ? '恢复屏蔽' : '查看屏蔽内容';
+    previewButton.setAttribute('aria-pressed', String(showBlockedContent));
   }
 
-  function createStatsButton() {
-    statsButton = document.createElement('button');
-    statsButton.type = 'button';
-    statsButton.id = 'bdf-stats';
-    statsButton.hidden = true;
-    statsButton.addEventListener('click', openConfigDialog);
-    document.body.append(statsButton);
+  function setBlockedContentPreview(visible, scrollToFirst = true) {
+    const firstHiddenCard = document.querySelector(`.${HIDDEN_CLASS}`);
+    showBlockedContent = Boolean(visible && firstHiddenCard);
+    document.documentElement.classList.toggle(PREVIEW_CLASS, showBlockedContent);
+    updateStats();
+
+    if (showBlockedContent && scrollToFirst) {
+      requestAnimationFrame(() => {
+        firstHiddenCard.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    }
+  }
+
+  function createStatusPanel() {
+    statusPanel = document.createElement('aside');
+    statusPanel.id = 'bdf-status';
+    statusPanel.hidden = true;
+    statusPanel.setAttribute('aria-label', '动态屏蔽状态');
+    statusPanel.innerHTML = `
+      <div id="bdf-status-count" aria-live="polite">已屏蔽 0 条动态</div>
+      <div class="bdf-status-actions">
+        <button type="button" data-action="preview" aria-pressed="false">查看屏蔽内容</button>
+        <button type="button" data-action="config">配置</button>
+      </div>
+    `;
+
+    statusCount = statusPanel.querySelector('#bdf-status-count');
+    previewButton = statusPanel.querySelector('[data-action="preview"]');
+    previewButton.addEventListener('click', () => {
+      setBlockedContentPreview(!showBlockedContent);
+    });
+    statusPanel.querySelector('[data-action="config"]').addEventListener('click', openConfigDialog);
+    document.body.append(statusPanel);
   }
 
   function formatErrors(errors) {
@@ -277,7 +349,7 @@
   }
 
   function openConfigDialog() {
-    document.getElementById('bdf-overlay')?.remove();
+    closeConfigDialog?.();
 
     const overlay = document.createElement('div');
     overlay.id = 'bdf-overlay';
@@ -287,6 +359,10 @@
         <label class="bdf-switch-row">
           <input id="bdf-enabled" type="checkbox">
           启用动态屏蔽
+        </label>
+        <label class="bdf-switch-row">
+          <input id="bdf-show-status" type="checkbox">
+          在右下角显示过滤状态
         </label>
         <label for="bdf-rules">屏蔽规则（每行一条）</label>
         <textarea id="bdf-rules" spellcheck="false" placeholder="广告\n/抽奖|推广/i"></textarea>
@@ -300,9 +376,11 @@
     `;
 
     const enabledInput = overlay.querySelector('#bdf-enabled');
+    const showStatusInput = overlay.querySelector('#bdf-show-status');
     const rulesInput = overlay.querySelector('#bdf-rules');
     const validation = overlay.querySelector('#bdf-validation');
     enabledInput.checked = config.enabled;
+    showStatusInput.checked = config.showStatusPanel;
     rulesInput.value = config.rulesText;
 
     const validate = () => {
@@ -315,6 +393,7 @@
     const close = () => {
       document.removeEventListener('keydown', handleKeydown);
       overlay.remove();
+      if (closeConfigDialog === close) closeConfigDialog = null;
     };
     const handleKeydown = (event) => {
       if (event.key === 'Escape') close();
@@ -327,12 +406,14 @@
       saveConfig({
         enabled: enabledInput.checked,
         rulesText: rulesInput.value,
+        showStatusPanel: showStatusInput.checked,
       });
       close();
     });
     overlay.addEventListener('click', (event) => {
       if (event.target === overlay) close();
     });
+    closeConfigDialog = close;
     document.addEventListener('keydown', handleKeydown);
     document.body.append(overlay);
     validate();
@@ -346,12 +427,36 @@
   function installStyles() {
     GM_addStyle(`
       .${HIDDEN_CLASS} { display: none !important; }
-      #bdf-stats {
-        position: fixed; right: 24px; bottom: 24px; z-index: 99998;
-        border: 0; border-radius: 999px; padding: 9px 14px;
-        color: #fff; background: #00aeec; box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
-        cursor: pointer; font-size: 13px;
+      html.${PREVIEW_CLASS} .${HIDDEN_CLASS} {
+        display: var(--bdf-original-display, block) !important; position: relative;
+        outline: 2px dashed #fb7299; outline-offset: 4px;
       }
+      html.${PREVIEW_CLASS} .${HIDDEN_CLASS}::before {
+        content: "已被动态屏蔽规则命中";
+        display: inline-block; position: relative; z-index: 1;
+        margin: 0 0 8px 12px; border-radius: 999px; padding: 4px 10px;
+        color: #fff; background: #fb7299; font-size: 12px; line-height: 1.4;
+      }
+      #bdf-status {
+        position: fixed; right: 24px; bottom: 24px; z-index: 99998;
+        min-width: 238px; box-sizing: border-box; border: 1px solid #e3e5e7;
+        border-radius: 12px; padding: 12px; color: #18191c; background: #fff;
+        box-shadow: 0 6px 24px rgb(0 0 0 / 16%);
+        font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      #bdf-status[hidden] { display: none !important; }
+      #bdf-status-count { margin-bottom: 10px; font-weight: 600; }
+      .bdf-status-actions { display: flex; gap: 8px; }
+      .bdf-status-actions button {
+        flex: 1; border: 1px solid #00aeec; border-radius: 7px; padding: 6px 9px;
+        color: #00aeec; background: #fff; cursor: pointer; white-space: nowrap;
+      }
+      .bdf-status-actions button:hover { background: #e3f6fc; }
+      .bdf-status-actions button:disabled {
+        border-color: #c9ccd0; color: #9499a0; background: #f1f2f3; cursor: not-allowed;
+      }
+      .bdf-status-actions [data-action="config"] { color: #fff; background: #00aeec; }
+      .bdf-status-actions [data-action="config"]:hover { background: #009bd3; }
       #bdf-overlay {
         position: fixed; inset: 0; z-index: 99999; display: grid; place-items: center;
         padding: 20px; background: rgb(0 0 0 / 45%); color: #18191c;
@@ -377,17 +482,25 @@
       .bdf-actions button { border: 1px solid #c9ccd0; border-radius: 8px; padding: 7px 14px; background: #fff; cursor: pointer; }
       .bdf-actions .bdf-primary { border-color: #00aeec; color: #fff; background: #00aeec; }
       @media (prefers-color-scheme: dark) {
-        #bdf-dialog, #bdf-rules { color: #e3e5e7; background: #242628; }
+        #bdf-status, #bdf-dialog, #bdf-rules { color: #e3e5e7; background: #242628; }
+        #bdf-status { border-color: #55585c; }
+        .bdf-status-actions button { background: #242628; }
+        .bdf-status-actions button:hover { background: #163846; }
+        .bdf-status-actions button:disabled { color: #777b80; background: #333538; }
+        .bdf-status-actions [data-action="config"] { color: #fff; background: #00aeec; }
         #bdf-rules, .bdf-actions button { border-color: #55585c; }
         .bdf-actions button { color: #e3e5e7; background: #333538; }
         .bdf-help { color: #aeb3b8; }
+      }
+      @media (max-width: 600px) {
+        #bdf-status { right: 12px; bottom: 12px; min-width: 218px; }
       }
     `);
   }
 
   function boot() {
     installStyles();
-    createStatsButton();
+    createStatusPanel();
     scanRoot(document.body);
     updateStats();
     observeDynamicContent();

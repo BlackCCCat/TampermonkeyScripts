@@ -9,6 +9,7 @@ function loadTestApi() {
     __dirname,
     '..',
     'scripts',
+    'bilibili',
     'bilibili-dynamic-filter.user.js',
   );
   const source = fs.readFileSync(scriptPath, 'utf8');
@@ -81,4 +82,41 @@ test('normalizes whitespace before matching', () => {
   const { rules } = parseRules('限时 优惠');
 
   assert.equal(findMatch('限时\n\t优惠', rules)?.source, '限时 优惠');
+});
+
+test('migrates existing configuration with the status panel enabled', () => {
+  const { normalizeConfig } = loadTestApi();
+
+  assert.deepEqual(
+    { ...normalizeConfig({ enabled: false, rulesText: '广告' }) },
+    { enabled: false, rulesText: '广告', showStatusPanel: true },
+  );
+});
+
+test('preserves an explicitly disabled status panel setting', () => {
+  const { normalizeConfig } = loadTestApi();
+
+  assert.equal(normalizeConfig({ showStatusPanel: false }).showStatusPanel, false);
+  assert.equal(normalizeConfig(null).showStatusPanel, true);
+});
+
+test('shows the status panel only for an active filter with rules', () => {
+  const { shouldShowStatusPanel } = loadTestApi();
+
+  assert.equal(
+    shouldShowStatusPanel({ enabled: true, showStatusPanel: true }, 1),
+    true,
+  );
+  assert.equal(
+    shouldShowStatusPanel({ enabled: true, showStatusPanel: false }, 1),
+    false,
+  );
+  assert.equal(
+    shouldShowStatusPanel({ enabled: false, showStatusPanel: true }, 1),
+    false,
+  );
+  assert.equal(
+    shouldShowStatusPanel({ enabled: true, showStatusPanel: true }, 0),
+    false,
+  );
 });
