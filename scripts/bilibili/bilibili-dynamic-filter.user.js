@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.2.1
+// @version      0.3.0
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -27,18 +27,27 @@
     enabled: true,
     rulesText: '',
     showStatusPanel: true,
+    filterVideoDynamics: true,
   });
+  const CONFIG_KEY = 'bilibili-dynamic-filter:config:v1';
+  const VIDEO_CONTENT_SELECTORS = [
+    '.bili-dyn-card-video__title',
+    '.bili-dyn-card-video__desc',
+  ];
   const CONTENT_SELECTOR = [
     '.bili-rich-text__content',
     '.bili-dyn-content__orig__desc',
     '.bili-dyn-content__forw__desc',
     '.dyn-card-opus__title',
     '.dyn-card-opus__summary',
-    '.bili-dyn-card-video__title',
-    '.bili-dyn-card-video__desc',
+    ...VIDEO_CONTENT_SELECTORS,
     '.bili-dyn-card-article__title',
     '.bili-dyn-card-article__desc',
     '.bili-dyn-card-reserve__title',
+  ].join(',');
+  const VIDEO_SELECTOR = [
+    '.bili-dyn-card-video',
+    ...VIDEO_CONTENT_SELECTORS,
   ].join(',');
   const normalizeText = (text) => String(text ?? '').replace(/\s+/g, ' ').trim();
 
@@ -61,7 +70,40 @@
       enabled: stored.enabled !== false,
       rulesText: typeof stored.rulesText === 'string' ? stored.rulesText : '',
       showStatusPanel: stored.showStatusPanel !== false,
+      filterVideoDynamics: stored.filterVideoDynamics !== false,
     };
+  }
+
+  function configsEqual(left, right) {
+    return Object.keys(DEFAULT_CONFIG).every((key) => left[key] === right[key]);
+  }
+
+  function persistConfig(storageKey, nextConfig, setValue, getValue) {
+    const normalized = normalizeConfig(nextConfig);
+    setValue(storageKey, normalized);
+    const storedValue = getValue(storageKey, null);
+    const stored = storedValue && typeof storedValue === 'object'
+      ? normalizeConfig(storedValue)
+      : null;
+    if (!stored || !configsEqual(normalized, stored)) {
+      throw new Error('配置写入 Tampermonkey Storage 后校验失败，请重试');
+    }
+    return normalized;
+  }
+
+  function isVideoDynamic(card) {
+    return Boolean(
+      card?.matches?.(VIDEO_SELECTOR) || card?.querySelector?.(VIDEO_SELECTOR),
+    );
+  }
+
+  function shouldHideMatchedCard(videoDynamic, filterVideoDynamics) {
+    return !videoDynamic || filterVideoDynamics;
+  }
+
+  function formatStatusText(hiddenCount, videoMatchCount, filterVideoDynamics) {
+    const videoSuffix = filterVideoDynamics ? '' : '（未过滤）';
+    return `已屏蔽 ${hiddenCount} 条动态 · 视频命中 ${videoMatchCount} 条${videoSuffix}`;
   }
 
   function shouldShowStatusPanel(currentConfig, ruleCount) {
@@ -155,21 +197,26 @@
       contentSelector: CONTENT_SELECTOR,
       extractCardText,
       findMatch,
+      formatStatusText,
+      isVideoDynamic,
       normalizeConfig,
       normalizeText,
       parseRules,
+      persistConfig,
+      shouldHideMatchedCard,
       shouldShowStatusPanel,
+      videoSelector: VIDEO_SELECTOR,
     };
     return;
   }
 
-  const CONFIG_KEY = 'bilibili-dynamic-filter:config:v1';
   const CARD_SELECTOR = [
     '.bili-dyn-list__item',
     '.bili-dyn-item',
     '[data-did]',
   ].join(',');
   const HIDDEN_CLASS = 'bdf-hidden-dynamic';
+  const VIDEO_MATCH_CLASS = 'bdf-matched-video-dynamic';
   const PREVIEW_CLASS = 'bdf-show-blocked-content';
   const OWNED_UI_SELECTOR = '#bdf-status, #bdf-overlay';
 
@@ -190,11 +237,16 @@
   }
 
   function saveConfig(nextConfig) {
-    config = normalizeConfig(nextConfig);
+    const savedConfig = persistConfig(
+      CONFIG_KEY,
+      nextConfig,
+      GM_setValue,
+      GM_getValue,
+    );
+    config = savedConfig;
     parsedRules = parseRules(config.rulesText).rules;
     configRevision += 1;
-    GM_setValue(CONFIG_KEY, config);
-    setBlockedContentPreview(false, false);
+    setBlockedContentPreview(false, false, false);
     scanRoot(document.body);
     updateStats();
   }
@@ -212,19 +264,35 @@
     if (!(card instanceof Element)) return;
 
     const text = extractCardText(card);
+    const videoDynamic = isVideoDynamic(card);
     const previous = cardState.get(card);
-    if (previous?.revision === configRevision && previous.text === text) return;
+    if (
+      previous?.revision === configRevision &&
+      previous.text === text &&
+      previous.videoDynamic === videoDynamic
+    ) return;
 
-    cardState.set(card, { revision: configRevision, text });
+    cardState.set(card, { revision: configRevision, text, videoDynamic });
     const match = config.enabled && parsedRules.length > 0
       ? findMatch(text, parsedRules)
       : null;
 
     if (!match) {
       card.classList.remove(HIDDEN_CLASS);
+      card.classList.remove(VIDEO_MATCH_CLASS);
       card.style.removeProperty('--bdf-original-display');
       card.removeAttribute('data-bdf-rule');
       card.removeAttribute('data-bdf-rule-type');
+      return;
+    }
+
+    card.classList.toggle(VIDEO_MATCH_CLASS, videoDynamic);
+    card.dataset.bdfRule = match.source;
+    card.dataset.bdfRuleType = match.type;
+
+    if (!shouldHideMatchedCard(videoDynamic, config.filterVideoDynamics)) {
+      card.classList.remove(HIDDEN_CLASS);
+      card.style.removeProperty('--bdf-original-display');
       return;
     }
 
@@ -235,8 +303,6 @@
       }
     }
     card.classList.add(HIDDEN_CLASS);
-    card.dataset.bdfRule = match.source;
-    card.dataset.bdfRuleType = match.type;
   }
 
   function scanRoot(root) {
@@ -302,8 +368,14 @@
   function updateStats() {
     if (!statusPanel) return;
 
-    const hiddenCards = document.querySelectorAll(`.${HIDDEN_CLASS}`);
-    const hiddenCount = hiddenCards.length;
+    let hiddenCount = 0;
+    let videoMatchCount = 0;
+    document
+      .querySelectorAll(`.${HIDDEN_CLASS}, .${VIDEO_MATCH_CLASS}`)
+      .forEach((card) => {
+        if (card.classList.contains(HIDDEN_CLASS)) hiddenCount += 1;
+        if (card.classList.contains(VIDEO_MATCH_CLASS)) videoMatchCount += 1;
+      });
     if (hiddenCount === 0 && showBlockedContent) {
       showBlockedContent = false;
       document.documentElement.classList.remove(PREVIEW_CLASS);
@@ -311,17 +383,26 @@
 
     const panelVisible = shouldShowStatusPanel(config, parsedRules.length);
     statusPanel.hidden = !panelVisible;
-    statusCount.textContent = `已屏蔽 ${hiddenCount} 条动态`;
+    const statusText = formatStatusText(
+      hiddenCount,
+      videoMatchCount,
+      config.filterVideoDynamics,
+    );
+    if (statusCount.textContent !== statusText) statusCount.textContent = statusText;
     previewButton.disabled = hiddenCount === 0;
-    previewButton.textContent = showBlockedContent ? '恢复屏蔽' : '查看屏蔽内容';
-    previewButton.setAttribute('aria-pressed', String(showBlockedContent));
+    const previewText = showBlockedContent ? '恢复屏蔽' : '查看屏蔽内容';
+    if (previewButton.textContent !== previewText) previewButton.textContent = previewText;
+    const pressed = String(showBlockedContent);
+    if (previewButton.getAttribute('aria-pressed') !== pressed) {
+      previewButton.setAttribute('aria-pressed', pressed);
+    }
   }
 
-  function setBlockedContentPreview(visible, scrollToFirst = true) {
-    const firstHiddenCard = document.querySelector(`.${HIDDEN_CLASS}`);
+  function setBlockedContentPreview(visible, scrollToFirst = true, refreshStats = true) {
+    const firstHiddenCard = visible ? document.querySelector(`.${HIDDEN_CLASS}`) : null;
     showBlockedContent = Boolean(visible && firstHiddenCard);
     document.documentElement.classList.toggle(PREVIEW_CLASS, showBlockedContent);
-    updateStats();
+    if (refreshStats) updateStats();
 
     if (showBlockedContent && scrollToFirst) {
       requestAnimationFrame(() => {
@@ -336,7 +417,7 @@
     statusPanel.hidden = true;
     statusPanel.setAttribute('aria-label', '动态屏蔽状态');
     statusPanel.innerHTML = `
-      <div id="bdf-status-count" aria-live="polite">已屏蔽 0 条动态</div>
+      <div id="bdf-status-count" aria-live="polite">${formatStatusText(0, 0, true)}</div>
       <div class="bdf-status-actions">
         <button type="button" data-action="preview" aria-pressed="false">查看屏蔽内容</button>
         <button type="button" data-action="config">配置</button>
@@ -372,6 +453,10 @@
           <input id="bdf-show-status" type="checkbox">
           在右下角显示过滤状态
         </label>
+        <label class="bdf-switch-row">
+          <input id="bdf-filter-video" type="checkbox">
+          过滤视频动态（关闭后仍统计命中数量）
+        </label>
         <label for="bdf-rules">屏蔽规则（每行一条）</label>
         <textarea id="bdf-rules" spellcheck="false" placeholder="广告\n/抽奖|推广/i"></textarea>
         <p class="bdf-help">普通文本按关键字匹配（不区分大小写）；以 <code>/表达式/标志</code> 书写正则；以 <code>#</code> 开头的行是注释。</p>
@@ -385,10 +470,12 @@
 
     const enabledInput = overlay.querySelector('#bdf-enabled');
     const showStatusInput = overlay.querySelector('#bdf-show-status');
+    const filterVideoInput = overlay.querySelector('#bdf-filter-video');
     const rulesInput = overlay.querySelector('#bdf-rules');
     const validation = overlay.querySelector('#bdf-validation');
     enabledInput.checked = config.enabled;
     showStatusInput.checked = config.showStatusPanel;
+    filterVideoInput.checked = config.filterVideoDynamics;
     rulesInput.value = config.rulesText;
 
     const validate = () => {
@@ -411,11 +498,20 @@
     overlay.querySelector('[data-action="cancel"]').addEventListener('click', close);
     overlay.querySelector('[data-action="save"]').addEventListener('click', () => {
       if (!validate()) return;
-      saveConfig({
-        enabled: enabledInput.checked,
-        rulesText: rulesInput.value,
-        showStatusPanel: showStatusInput.checked,
-      });
+      try {
+        saveConfig({
+          enabled: enabledInput.checked,
+          rulesText: rulesInput.value,
+          showStatusPanel: showStatusInput.checked,
+          filterVideoDynamics: filterVideoInput.checked,
+        });
+      } catch (error) {
+        validation.textContent = error instanceof Error
+          ? error.message
+          : '配置写入 Tampermonkey Storage 失败，请重试';
+        validation.classList.add('bdf-error');
+        return;
+      }
       close();
     });
     overlay.addEventListener('click', (event) => {
@@ -429,7 +525,12 @@
   }
 
   function toggleFiltering() {
-    saveConfig({ ...config, enabled: !config.enabled });
+    try {
+      saveConfig({ ...config, enabled: !config.enabled });
+    } catch (error) {
+      console.error('[哔哩哔哩动态屏蔽] 配置保存失败', error);
+      window.alert('动态屏蔽开关保存失败，请打开配置页面重试。');
+    }
   }
 
   function installStyles() {
@@ -447,7 +548,7 @@
       }
       #bdf-status {
         position: fixed; right: 24px; bottom: 24px; z-index: 99998;
-        min-width: 238px; box-sizing: border-box; border: 1px solid #e3e5e7;
+        min-width: 280px; max-width: 340px; box-sizing: border-box; border: 1px solid #e3e5e7;
         border-radius: 12px; padding: 12px; color: #18191c; background: #fff;
         box-shadow: 0 6px 24px rgb(0 0 0 / 16%);
         font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -501,7 +602,7 @@
         .bdf-help { color: #aeb3b8; }
       }
       @media (max-width: 600px) {
-        #bdf-status { right: 12px; bottom: 12px; min-width: 218px; }
+        #bdf-status { right: 12px; bottom: 12px; min-width: 0; max-width: calc(100vw - 24px); }
       }
     `);
   }

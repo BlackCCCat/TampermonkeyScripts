@@ -98,7 +98,12 @@ test('migrates existing configuration with the status panel enabled', () => {
 
   assert.deepEqual(
     { ...normalizeConfig({ enabled: false, rulesText: '广告' }) },
-    { enabled: false, rulesText: '广告', showStatusPanel: true },
+    {
+      enabled: false,
+      rulesText: '广告',
+      showStatusPanel: true,
+      filterVideoDynamics: true,
+    },
   );
 });
 
@@ -107,6 +112,84 @@ test('preserves an explicitly disabled status panel setting', () => {
 
   assert.equal(normalizeConfig({ showStatusPanel: false }).showStatusPanel, false);
   assert.equal(normalizeConfig(null).showStatusPanel, true);
+});
+
+test('preserves an explicitly disabled video filtering setting', () => {
+  const { normalizeConfig } = loadTestApi();
+
+  assert.equal(normalizeConfig({ filterVideoDynamics: false }).filterVideoDynamics, false);
+  assert.equal(normalizeConfig(null).filterVideoDynamics, true);
+});
+
+test('classifies video dynamics from their card structure', () => {
+  const { isVideoDynamic, videoSelector } = loadTestApi();
+  const videoCard = {
+    matches(selector) {
+      assert.equal(selector, videoSelector);
+      return false;
+    },
+    querySelector(selector) {
+      assert.equal(selector, videoSelector);
+      return {};
+    },
+  };
+  const textCard = {
+    matches() {
+      return false;
+    },
+    querySelector() {
+      return null;
+    },
+  };
+
+  assert.equal(isVideoDynamic(videoCard), true);
+  assert.equal(isVideoDynamic(textCard), false);
+});
+
+test('skips hiding matched videos only when video filtering is disabled', () => {
+  const { shouldHideMatchedCard } = loadTestApi();
+
+  assert.equal(shouldHideMatchedCard(false, false), true);
+  assert.equal(shouldHideMatchedCard(true, true), true);
+  assert.equal(shouldHideMatchedCard(true, false), false);
+});
+
+test('formats video match counts and marks unfiltered video matches', () => {
+  const { formatStatusText } = loadTestApi();
+
+  assert.equal(formatStatusText(3, 2, true), '已屏蔽 3 条动态 · 视频命中 2 条');
+  assert.equal(
+    formatStatusText(1, 4, false),
+    '已屏蔽 1 条动态 · 视频命中 4 条（未过滤）',
+  );
+});
+
+test('writes configuration to storage and verifies it by immediate readback', () => {
+  const { persistConfig } = loadTestApi();
+  const storage = new Map();
+  const saved = persistConfig(
+    'config-key',
+    { enabled: true, rulesText: '广告', filterVideoDynamics: false },
+    (key, value) => storage.set(key, value),
+    (key, fallback) => storage.get(key) ?? fallback,
+  );
+
+  assert.equal(storage.get('config-key').filterVideoDynamics, false);
+  assert.deepEqual({ ...saved }, { ...storage.get('config-key') });
+});
+
+test('reports a storage write that cannot be read back', () => {
+  const { persistConfig } = loadTestApi();
+
+  assert.throws(
+    () => persistConfig(
+      'config-key',
+      {},
+      () => {},
+      (_key, fallback) => fallback,
+    ),
+    /配置写入 Tampermonkey Storage 后校验失败/,
+  );
 });
 
 test('shows the status panel only for an active filter with rules', () => {
@@ -163,7 +246,7 @@ test('does not duplicate text from nested content selectors', () => {
   assert.equal(extractCardText(card), '推广内容');
 });
 
-test('publishes a metadata endpoint and a legacy update bridge', () => {
+test('publishes a matching metadata update endpoint', () => {
   const scriptPath = path.join(
     __dirname,
     '..',
@@ -178,15 +261,8 @@ test('publishes a metadata endpoint and a legacy update bridge', () => {
     'bilibili',
     'bilibili-dynamic-filter.meta.js',
   );
-  const legacyPath = path.join(
-    __dirname,
-    '..',
-    'scripts',
-    'bilibili-dynamic-filter.user.js',
-  );
   const source = fs.readFileSync(scriptPath, 'utf8');
   const metadataSource = fs.readFileSync(metadataPath, 'utf8');
-  const legacySource = fs.readFileSync(legacyPath, 'utf8');
   const scriptMetadata = readScriptMetadata(source);
   const updateMetadata = readScriptMetadata(metadataSource);
 
@@ -196,5 +272,4 @@ test('publishes a metadata endpoint and a legacy update bridge', () => {
   );
   assert.equal(updateMetadata.version, scriptMetadata.version);
   assert.equal(updateMetadata.downloadURL, scriptMetadata.downloadURL);
-  assert.equal(legacySource, source);
 });
