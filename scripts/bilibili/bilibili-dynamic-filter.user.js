@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.3.0
+// @version      0.4.0
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -29,7 +29,12 @@
     showStatusPanel: true,
     filterVideoDynamics: true,
   });
+  const DEFAULT_UI_STATE = Object.freeze({
+    compact: false,
+    position: null,
+  });
   const CONFIG_KEY = 'bilibili-dynamic-filter:config:v1';
+  const UI_STATE_KEY = 'bilibili-dynamic-filter:ui:v1';
   const VIDEO_CONTENT_SELECTORS = [
     '.bili-dyn-card-video__title',
     '.bili-dyn-card-video__desc',
@@ -78,17 +83,83 @@
     return Object.keys(DEFAULT_CONFIG).every((key) => left[key] === right[key]);
   }
 
-  function persistConfig(storageKey, nextConfig, setValue, getValue) {
-    const normalized = normalizeConfig(nextConfig);
+  function persistNormalizedValue(
+    storageKey,
+    nextValue,
+    { normalize, valuesEqual, setValue, getValue, errorMessage },
+  ) {
+    const normalized = normalize(nextValue);
     setValue(storageKey, normalized);
     const storedValue = getValue(storageKey, null);
     const stored = storedValue && typeof storedValue === 'object'
-      ? normalizeConfig(storedValue)
+      ? normalize(storedValue)
       : null;
-    if (!stored || !configsEqual(normalized, stored)) {
-      throw new Error('配置写入 Tampermonkey Storage 后校验失败，请重试');
+    if (!stored || !valuesEqual(normalized, stored)) {
+      throw new Error(errorMessage);
     }
     return normalized;
+  }
+
+  function persistConfig(storageKey, nextConfig, setValue, getValue) {
+    return persistNormalizedValue(
+      storageKey,
+      nextConfig,
+      {
+        normalize: normalizeConfig,
+        valuesEqual: configsEqual,
+        setValue,
+        getValue,
+        errorMessage: '配置写入 Tampermonkey Storage 后校验失败，请重试',
+      },
+    );
+  }
+
+  function normalizeUiState(stored) {
+    const position = stored?.position;
+    const validPosition = (
+      position &&
+      Number.isFinite(position.x) &&
+      Number.isFinite(position.y)
+    ) ? { x: position.x, y: position.y } : null;
+    return {
+      compact: stored?.compact === true,
+      position: validPosition,
+    };
+  }
+
+  function uiStatesEqual(left, right) {
+    return (
+      left.compact === right.compact &&
+      left.position?.x === right.position?.x &&
+      left.position?.y === right.position?.y
+    );
+  }
+
+  function persistUiState(storageKey, nextState, setValue, getValue) {
+    return persistNormalizedValue(
+      storageKey,
+      nextState,
+      {
+        normalize: normalizeUiState,
+        valuesEqual: uiStatesEqual,
+        setValue,
+        getValue,
+        errorMessage: '状态面板位置写入 Tampermonkey Storage 后校验失败',
+      },
+    );
+  }
+
+  function clampPanelPosition(position, viewport, panel, margin = 8) {
+    const maxX = Math.max(margin, viewport.width - panel.width - margin);
+    const maxY = Math.max(margin, viewport.height - panel.height - margin);
+    return {
+      x: Math.min(Math.max(position.x, margin), maxX),
+      y: Math.min(Math.max(position.y, margin), maxY),
+    };
+  }
+
+  function isDragGesture(start, current, threshold = 4) {
+    return Math.hypot(current.x - start.x, current.y - start.y) >= threshold;
   }
 
   function isVideoDynamic(card) {
@@ -195,14 +266,18 @@
   if (globalThis.__BDF_TEST_MODE__) {
     globalThis.__BDF_TEST_EXPORTS__ = {
       contentSelector: CONTENT_SELECTOR,
+      clampPanelPosition,
       extractCardText,
       findMatch,
       formatStatusText,
       isVideoDynamic,
+      isDragGesture,
       normalizeConfig,
+      normalizeUiState,
       normalizeText,
       parseRules,
       persistConfig,
+      persistUiState,
       shouldHideMatchedCard,
       shouldShowStatusPanel,
       videoSelector: VIDEO_SELECTOR,
@@ -221,19 +296,39 @@
   const OWNED_UI_SELECTOR = '#bdf-status, #bdf-overlay';
 
   let config = loadConfig();
+  let uiState = loadUiState();
   let parsedRules = parseRules(config.rulesText).rules;
   let configRevision = 0;
   let pendingTimer;
   let showBlockedContent = false;
   let statusPanel;
   let statusCount;
+  let compactHiddenCount;
+  let compactVideoCount;
+  let compactToggle;
   let previewButton;
+  let activePanelDrag = false;
+  let suppressCompactClick = false;
   let closeConfigDialog = null;
   const pendingRoots = new Set();
   const cardState = new WeakMap();
 
   function loadConfig() {
     return normalizeConfig(GM_getValue(CONFIG_KEY, DEFAULT_CONFIG));
+  }
+
+  function loadUiState() {
+    return normalizeUiState(GM_getValue(UI_STATE_KEY, DEFAULT_UI_STATE));
+  }
+
+  function saveUiState(nextState) {
+    uiState = persistUiState(
+      UI_STATE_KEY,
+      nextState,
+      GM_setValue,
+      GM_getValue,
+    );
+    return uiState;
   }
 
   function saveConfig(nextConfig) {
@@ -381,6 +476,7 @@
       document.documentElement.classList.remove(PREVIEW_CLASS);
     }
 
+    const wasHidden = statusPanel.hidden;
     const panelVisible = shouldShowStatusPanel(config, parsedRules.length);
     statusPanel.hidden = !panelVisible;
     const statusText = formatStatusText(
@@ -389,12 +485,28 @@
       config.filterVideoDynamics,
     );
     if (statusCount.textContent !== statusText) statusCount.textContent = statusText;
+    const hiddenText = String(hiddenCount);
+    const videoText = String(videoMatchCount);
+    const compactStatsChanged = (
+      compactHiddenCount.textContent !== hiddenText ||
+      compactVideoCount.textContent !== videoText
+    );
+    if (compactHiddenCount.textContent !== hiddenText) compactHiddenCount.textContent = hiddenText;
+    if (compactVideoCount.textContent !== videoText) compactVideoCount.textContent = videoText;
+    const videoLabel = config.filterVideoDynamics ? '视频命中' : '视频命中（未过滤）';
+    const compactLabel = `已屏蔽 ${hiddenCount} 条动态，${videoLabel} ${videoMatchCount} 条；点击展开，拖动调整位置`;
+    if (compactToggle.getAttribute('aria-label') !== compactLabel) {
+      compactToggle.setAttribute('aria-label', compactLabel);
+    }
     previewButton.disabled = hiddenCount === 0;
     const previewText = showBlockedContent ? '恢复屏蔽' : '查看屏蔽内容';
     if (previewButton.textContent !== previewText) previewButton.textContent = previewText;
     const pressed = String(showBlockedContent);
     if (previewButton.getAttribute('aria-pressed') !== pressed) {
       previewButton.setAttribute('aria-pressed', pressed);
+    }
+    if (panelVisible && (wasHidden || (uiState.compact && compactStatsChanged))) {
+      requestAnimationFrame(applyStatusPanelPosition);
     }
   }
 
@@ -411,25 +523,182 @@
     }
   }
 
+  function setStatusPanelPosition(position) {
+    statusPanel.style.left = `${Math.round(position.x)}px`;
+    statusPanel.style.top = `${Math.round(position.y)}px`;
+    statusPanel.style.right = 'auto';
+    statusPanel.style.bottom = 'auto';
+  }
+
+  function applyStatusPanelPosition() {
+    if (!statusPanel || statusPanel.hidden || activePanelDrag) return;
+    if (!uiState.position) {
+      statusPanel.style.removeProperty('left');
+      statusPanel.style.removeProperty('top');
+      statusPanel.style.removeProperty('right');
+      statusPanel.style.removeProperty('bottom');
+      return;
+    }
+
+    const rect = statusPanel.getBoundingClientRect();
+    setStatusPanelPosition(clampPanelPosition(
+      uiState.position,
+      { width: window.innerWidth, height: window.innerHeight },
+      { width: rect.width, height: rect.height },
+    ));
+  }
+
+  function setStatusPanelCompact(compact) {
+    try {
+      saveUiState({ ...uiState, compact });
+    } catch (error) {
+      console.error('[哔哩哔哩动态屏蔽] 状态面板显示模式保存失败', error);
+      return;
+    }
+
+    statusPanel.classList.toggle('bdf-compact', uiState.compact);
+    applyStatusPanelPosition();
+  }
+
+  function installPanelDragging(handle, compactHandle = false) {
+    let dragSession = null;
+
+    handle.addEventListener('pointerdown', (event) => {
+      if (dragSession || activePanelDrag) return;
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      if (!compactHandle && event.target.closest('button')) return;
+
+      const rect = statusPanel.getBoundingClientRect();
+      dragSession = {
+        pointerId: event.pointerId,
+        startPointer: { x: event.clientX, y: event.clientY },
+        startPosition: { x: rect.left, y: rect.top },
+        panelSize: { width: rect.width, height: rect.height },
+        moved: false,
+      };
+      activePanelDrag = true;
+      handle.setPointerCapture?.(event.pointerId);
+    });
+
+    handle.addEventListener('pointermove', (event) => {
+      if (!dragSession || event.pointerId !== dragSession.pointerId) return;
+
+      const current = { x: event.clientX, y: event.clientY };
+      if (!dragSession.moved) {
+        dragSession.moved = isDragGesture(dragSession.startPointer, current);
+        if (!dragSession.moved) return;
+        statusPanel.classList.add('bdf-dragging');
+      }
+
+      const position = clampPanelPosition(
+        {
+          x: dragSession.startPosition.x + current.x - dragSession.startPointer.x,
+          y: dragSession.startPosition.y + current.y - dragSession.startPointer.y,
+        },
+        { width: window.innerWidth, height: window.innerHeight },
+        dragSession.panelSize,
+      );
+      setStatusPanelPosition(position);
+      event.preventDefault();
+    });
+
+    const finishDrag = (event, persistPosition) => {
+      if (!dragSession || event.pointerId !== dragSession.pointerId) return;
+
+      const { moved } = dragSession;
+      dragSession = null;
+      activePanelDrag = false;
+      statusPanel.classList.remove('bdf-dragging');
+      if (handle.hasPointerCapture?.(event.pointerId)) {
+        handle.releasePointerCapture(event.pointerId);
+      }
+
+      if (!moved) {
+        applyStatusPanelPosition();
+        return;
+      }
+      if (compactHandle) {
+        suppressCompactClick = true;
+        setTimeout(() => {
+          suppressCompactClick = false;
+        }, 0);
+      }
+
+      if (!persistPosition) {
+        applyStatusPanelPosition();
+        return;
+      }
+
+      const previousState = uiState;
+      const rect = statusPanel.getBoundingClientRect();
+      const position = clampPanelPosition(
+        { x: rect.left, y: rect.top },
+        { width: window.innerWidth, height: window.innerHeight },
+        { width: rect.width, height: rect.height },
+      );
+      setStatusPanelPosition(position);
+      const nextState = {
+        ...uiState,
+        position: { x: Math.round(position.x), y: Math.round(position.y) },
+      };
+      if (uiStatesEqual(uiState, nextState)) return;
+      try {
+        saveUiState(nextState);
+      } catch (error) {
+        uiState = previousState;
+        applyStatusPanelPosition();
+        console.error('[哔哩哔哩动态屏蔽] 状态面板位置保存失败', error);
+      }
+    };
+
+    handle.addEventListener('pointerup', (event) => finishDrag(event, true));
+    handle.addEventListener('pointercancel', (event) => finishDrag(event, false));
+  }
+
   function createStatusPanel() {
     statusPanel = document.createElement('aside');
     statusPanel.id = 'bdf-status';
     statusPanel.hidden = true;
     statusPanel.setAttribute('aria-label', '动态屏蔽状态');
     statusPanel.innerHTML = `
-      <div id="bdf-status-count" aria-live="polite">${formatStatusText(0, 0, true)}</div>
-      <div class="bdf-status-actions">
-        <button type="button" data-action="preview" aria-pressed="false">查看屏蔽内容</button>
-        <button type="button" data-action="config">配置</button>
+      <div class="bdf-status-expanded">
+        <div class="bdf-status-header" title="拖动调整位置">
+          <div id="bdf-status-count" aria-live="polite">${formatStatusText(0, 0, true)}</div>
+          <button type="button" class="bdf-collapse" data-action="collapse" aria-label="缩小状态面板" title="缩小">−</button>
+        </div>
+        <div class="bdf-status-actions">
+          <button type="button" data-action="preview" aria-pressed="false">查看屏蔽内容</button>
+          <button type="button" data-action="config">配置</button>
+        </div>
       </div>
+      <button id="bdf-compact-toggle" type="button" title="粉色：已屏蔽动态；蓝色：视频命中。点击展开，拖动调整位置">
+        <span class="bdf-mini-stat bdf-mini-hidden"><strong id="bdf-mini-hidden">0</strong></span>
+        <span class="bdf-mini-stat bdf-mini-video"><strong id="bdf-mini-video">0</strong></span>
+      </button>
     `;
 
     statusCount = statusPanel.querySelector('#bdf-status-count');
+    compactHiddenCount = statusPanel.querySelector('#bdf-mini-hidden');
+    compactVideoCount = statusPanel.querySelector('#bdf-mini-video');
+    compactToggle = statusPanel.querySelector('#bdf-compact-toggle');
     previewButton = statusPanel.querySelector('[data-action="preview"]');
     previewButton.addEventListener('click', () => {
       setBlockedContentPreview(!showBlockedContent);
     });
     statusPanel.querySelector('[data-action="config"]').addEventListener('click', openConfigDialog);
+    statusPanel.querySelector('[data-action="collapse"]').addEventListener('click', () => {
+      setStatusPanelCompact(true);
+    });
+    compactToggle.addEventListener('click', () => {
+      if (suppressCompactClick) {
+        suppressCompactClick = false;
+        return;
+      }
+      setStatusPanelCompact(false);
+    });
+    installPanelDragging(statusPanel.querySelector('.bdf-status-header'));
+    installPanelDragging(compactToggle, true);
+    statusPanel.classList.toggle('bdf-compact', uiState.compact);
     document.body.append(statusPanel);
   }
 
@@ -554,7 +823,37 @@
         font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
       #bdf-status[hidden] { display: none !important; }
-      #bdf-status-count { margin-bottom: 10px; font-weight: 600; }
+      #bdf-status.bdf-compact {
+        min-width: 0; width: auto; max-width: none; border: 0; border-radius: 12px; padding: 5px;
+        background: rgb(255 255 255 / 94%); box-shadow: 0 4px 16px rgb(0 0 0 / 18%);
+      }
+      #bdf-status.bdf-dragging { box-shadow: 0 10px 32px rgb(0 0 0 / 24%); }
+      .bdf-status-expanded { display: block; }
+      #bdf-status.bdf-compact .bdf-status-expanded { display: none; }
+      .bdf-status-header {
+        display: flex; align-items: center; gap: 8px; margin-bottom: 10px;
+        cursor: grab; touch-action: none; user-select: none;
+      }
+      #bdf-status.bdf-dragging .bdf-status-header,
+      #bdf-status.bdf-dragging #bdf-compact-toggle { cursor: grabbing; }
+      #bdf-status-count { flex: 1; font-weight: 600; }
+      .bdf-collapse {
+        flex: 0 0 auto; width: 24px; height: 24px; border: 0; border-radius: 50%; padding: 0;
+        color: #61666d; background: #f1f2f3; cursor: pointer; font: 700 17px/22px sans-serif;
+      }
+      .bdf-collapse:hover { color: #00aeec; background: #e3f6fc; }
+      #bdf-compact-toggle {
+        display: none; align-items: center; gap: 5px; border: 0; padding: 0;
+        color: #fff; background: transparent; cursor: grab; touch-action: none; user-select: none;
+      }
+      #bdf-status.bdf-compact #bdf-compact-toggle { display: flex; }
+      .bdf-mini-stat {
+        display: grid; place-items: center; min-width: 34px; height: 30px;
+        box-sizing: border-box; border-radius: 8px; padding: 0 7px;
+        color: #fff; font-size: 14px; line-height: 1; font-variant-numeric: tabular-nums;
+      }
+      .bdf-mini-hidden { background: #fb7299; }
+      .bdf-mini-video { background: #00aeec; }
       .bdf-status-actions { display: flex; gap: 8px; }
       .bdf-status-actions button {
         flex: 1; border: 1px solid #00aeec; border-radius: 7px; padding: 6px 9px;
@@ -593,6 +892,9 @@
       @media (prefers-color-scheme: dark) {
         #bdf-status, #bdf-dialog, #bdf-rules { color: #e3e5e7; background: #242628; }
         #bdf-status { border-color: #55585c; }
+        #bdf-status.bdf-compact { background: rgb(36 38 40 / 94%); }
+        .bdf-collapse { color: #aeb3b8; background: #333538; }
+        .bdf-collapse:hover { color: #00aeec; background: #163846; }
         .bdf-status-actions button { background: #242628; }
         .bdf-status-actions button:hover { background: #163846; }
         .bdf-status-actions button:disabled { color: #777b80; background: #333538; }
@@ -613,6 +915,14 @@
     scanRoot(document.body);
     updateStats();
     observeDynamicContent();
+    let resizeFrame;
+    window.addEventListener('resize', () => {
+      if (!uiState.position || statusPanel.hidden || resizeFrame) return;
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = undefined;
+        applyStatusPanelPosition();
+      });
+    });
   }
 
   GM_registerMenuCommand('配置动态屏蔽规则', openConfigDialog);

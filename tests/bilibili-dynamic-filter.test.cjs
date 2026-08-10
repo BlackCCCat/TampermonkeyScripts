@@ -164,6 +164,64 @@ test('formats video match counts and marks unfiltered video matches', () => {
   );
 });
 
+test('normalizes persisted status panel UI state', () => {
+  const { normalizeUiState } = loadTestApi();
+  const restored = normalizeUiState({
+    compact: true,
+    position: { x: 128.5, y: 64 },
+  });
+
+  assert.equal(restored.compact, true);
+  assert.equal(restored.position.x, 128.5);
+  assert.equal(restored.position.y, 64);
+  assert.equal(normalizeUiState({ position: { x: '128', y: 64 } }).position, null);
+  assert.equal(normalizeUiState(null).compact, false);
+});
+
+test('clamps a dragged panel inside the visible viewport', () => {
+  const { clampPanelPosition } = loadTestApi();
+
+  assert.deepEqual(
+    { ...clampPanelPosition(
+      { x: -20, y: 900 },
+      { width: 800, height: 600 },
+      { width: 280, height: 120 },
+    ) },
+    { x: 8, y: 472 },
+  );
+  assert.deepEqual(
+    { ...clampPanelPosition(
+      { x: 700, y: -10 },
+      { width: 800, height: 600 },
+      { width: 64, height: 44 },
+    ) },
+    { x: 700, y: 8 },
+  );
+});
+
+test('distinguishes a drag from a click using a movement threshold', () => {
+  const { isDragGesture } = loadTestApi();
+
+  assert.equal(isDragGesture({ x: 10, y: 10 }, { x: 13, y: 14 }), true);
+  assert.equal(isDragGesture({ x: 10, y: 10 }, { x: 12, y: 12 }), false);
+});
+
+test('persists compact mode and panel position with immediate readback', () => {
+  const { persistUiState } = loadTestApi();
+  const storage = new Map();
+  const saved = persistUiState(
+    'ui-key',
+    { compact: true, position: { x: 120, y: 80 } },
+    (key, value) => storage.set(key, value),
+    (key, fallback) => storage.get(key) ?? fallback,
+  );
+
+  assert.equal(saved.compact, true);
+  assert.equal(saved.position.x, 120);
+  assert.equal(saved.position.y, 80);
+  assert.equal(storage.get('ui-key').compact, true);
+});
+
 test('writes configuration to storage and verifies it by immediate readback', () => {
   const { persistConfig } = loadTestApi();
   const storage = new Map();
