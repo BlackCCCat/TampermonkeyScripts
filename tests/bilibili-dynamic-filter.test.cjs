@@ -164,6 +164,25 @@ test('formats video match counts and marks unfiltered video matches', () => {
   );
 });
 
+test('keeps only preview modes that still have matching hidden cards', () => {
+  const { resolvePreviewMode } = loadTestApi();
+
+  assert.equal(resolvePreviewMode('all', 3, 1), 'all');
+  assert.equal(resolvePreviewMode('video', 3, 1), 'video');
+  assert.equal(resolvePreviewMode('all', 0, 0), 'none');
+  assert.equal(resolvePreviewMode('video', 3, 0), 'none');
+  assert.equal(resolvePreviewMode('unexpected', 3, 1), 'none');
+});
+
+test('clicking the active preview mode restores filtering', () => {
+  const { togglePreviewMode } = loadTestApi();
+
+  assert.equal(togglePreviewMode('none', 'all'), 'all');
+  assert.equal(togglePreviewMode('video', 'all'), 'all');
+  assert.equal(togglePreviewMode('all', 'all'), 'none');
+  assert.equal(togglePreviewMode('video', 'video'), 'none');
+});
+
 test('normalizes persisted status panel UI state', () => {
   const { normalizeUiState } = loadTestApi();
   const restored = normalizeUiState({
