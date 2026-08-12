@@ -121,6 +121,34 @@ test('preserves an explicitly disabled video filtering setting', () => {
   assert.equal(normalizeConfig(null).filterVideoDynamics, true);
 });
 
+test('merges local config edits with newer values from another tab', () => {
+  const { mergeConfigEdits } = loadTestApi();
+  const baseline = {
+    enabled: true,
+    rulesText: '旧规则',
+    showStatusPanel: true,
+    filterVideoDynamics: true,
+  };
+  const edited = { ...baseline, rulesText: '本地新规则' };
+  const latest = { ...baseline, showStatusPanel: false };
+  const resolved = mergeConfigEdits(baseline, edited, latest);
+
+  assert.deepEqual(Array.from(resolved.conflicts), []);
+  assert.equal(resolved.config.rulesText, '本地新规则');
+  assert.equal(resolved.config.showStatusPanel, false);
+});
+
+test('reports a conflict when two tabs edit the same config field', () => {
+  const { mergeConfigEdits } = loadTestApi();
+  const baseline = { rulesText: '旧规则' };
+  const edited = { rulesText: '标签页 A' };
+  const latest = { rulesText: '标签页 B' };
+  const resolved = mergeConfigEdits(baseline, edited, latest);
+
+  assert.deepEqual(Array.from(resolved.conflicts), ['rulesText']);
+  assert.equal(resolved.config.rulesText, '标签页 B');
+});
+
 test('classifies video dynamics from their card structure', () => {
   const { isVideoDynamic, videoSelector } = loadTestApi();
   const videoCard = {
@@ -225,10 +253,10 @@ test('distinguishes a drag from a click using a movement threshold', () => {
   assert.equal(isDragGesture({ x: 10, y: 10 }, { x: 12, y: 12 }), false);
 });
 
-test('persists compact mode and panel position with immediate readback', () => {
+test('persists compact mode and panel position after the storage write completes', async () => {
   const { persistUiState } = loadTestApi();
   const storage = new Map();
-  const saved = persistUiState(
+  const saved = await persistUiState(
     'ui-key',
     { compact: true, position: { x: 120, y: 80 } },
     (key, value) => storage.set(key, value),
@@ -241,32 +269,130 @@ test('persists compact mode and panel position with immediate readback', () => {
   assert.equal(storage.get('ui-key').compact, true);
 });
 
-test('writes configuration to storage and verifies it by immediate readback', () => {
+test('waits for configuration storage before verifying the saved value', async () => {
   const { persistConfig } = loadTestApi();
   const storage = new Map();
-  const saved = persistConfig(
+  let finishWrite;
+  let finishRead;
+  let readBeforeWriteFinished = false;
+  let readStarted = false;
+  const writeFinished = new Promise((resolve) => {
+    finishWrite = resolve;
+  });
+  const readFinished = new Promise((resolve) => {
+    finishRead = resolve;
+  });
+  const saving = persistConfig(
     'config-key',
     { enabled: true, rulesText: '广告', filterVideoDynamics: false },
-    (key, value) => storage.set(key, value),
-    (key, fallback) => storage.get(key) ?? fallback,
+    async (key, value) => {
+      await writeFinished;
+      storage.set(key, value);
+    },
+    async (key, fallback) => {
+      if (!storage.has(key)) readBeforeWriteFinished = true;
+      readStarted = true;
+      await readFinished;
+      return storage.get(key) ?? fallback;
+    },
   );
+  await Promise.resolve();
+  assert.equal(readBeforeWriteFinished, false);
+  finishWrite();
+  while (!readStarted) await Promise.resolve();
+  let saveSettled = false;
+  saving.finally(() => {
+    saveSettled = true;
+  });
+  await Promise.resolve();
+  assert.equal(saveSettled, false);
+  finishRead();
+  const saved = await saving;
 
   assert.equal(storage.get('config-key').filterVideoDynamics, false);
   assert.deepEqual({ ...saved }, { ...storage.get('config-key') });
 });
 
-test('reports a storage write that cannot be read back', () => {
+test('reports a storage write that cannot be read back', async () => {
   const { persistConfig } = loadTestApi();
 
-  assert.throws(
-    () => persistConfig(
+  await assert.rejects(
+    persistConfig(
       'config-key',
       {},
-      () => {},
+      async () => {},
       (_key, fallback) => fallback,
     ),
     /配置写入 Tampermonkey Storage 后校验失败/,
   );
+});
+
+test('does not verify configuration after Tampermonkey rejects the write', async () => {
+  const { persistConfig } = loadTestApi();
+  let readAttempted = false;
+
+  await assert.rejects(
+    persistConfig(
+      'config-key',
+      { rulesText: '新规则' },
+      async () => {
+        throw new Error('storage unavailable');
+      },
+      () => {
+        readAttempted = true;
+        return null;
+      },
+    ),
+    /storage unavailable/,
+  );
+  assert.equal(readAttempted, false);
+});
+
+test('serializes state patches and merges each patch into the latest saved state', async () => {
+  const { createSerializedUpdateQueue } = loadTestApi();
+  let state = { compact: false, position: null };
+  let finishFirstWrite;
+  const firstWriteFinished = new Promise((resolve) => {
+    finishFirstWrite = resolve;
+  });
+  let writeCount = 0;
+  const updateState = createSerializedUpdateQueue(async (patch) => {
+    const nextState = { ...state, ...patch };
+    writeCount += 1;
+    if (writeCount === 1) await firstWriteFinished;
+    state = nextState;
+    return state;
+  });
+
+  const compactSave = updateState({ compact: true });
+  const positionSave = updateState({ position: { x: 120, y: 80 } });
+  await Promise.resolve();
+  assert.equal(writeCount, 1);
+  finishFirstWrite();
+  await Promise.all([compactSave, positionSave]);
+
+  assert.equal(writeCount, 2);
+  assert.deepEqual(state, {
+    compact: true,
+    position: { x: 120, y: 80 },
+  });
+});
+
+test('continues serialized updates after an earlier update fails', async () => {
+  const { createSerializedUpdateQueue } = loadTestApi();
+  const calls = [];
+  const update = createSerializedUpdateQueue(async (value) => {
+    calls.push(value);
+    if (value === 'first') throw new Error('first failed');
+    return value;
+  });
+
+  const first = update('first');
+  const second = update('second');
+
+  await assert.rejects(first, /first failed/);
+  assert.equal(await second, 'second');
+  assert.deepEqual(calls, ['first', 'second']);
 });
 
 test('shows the status panel only for an active filter with rules', () => {

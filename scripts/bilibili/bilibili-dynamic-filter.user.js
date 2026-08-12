@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.5.0
+// @version      0.5.1
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -13,9 +13,11 @@
 // @match        https://space.bilibili.com/*/dynamic*
 // @icon         https://www.bilibili.com/favicon.ico
 // @grant        GM_addStyle
+// @grant        GM.getValue
 // @grant        GM_getValue
+// @grant        GM_addValueChangeListener
 // @grant        GM_registerMenuCommand
-// @grant        GM_setValue
+// @grant        GM.setValue
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -83,14 +85,33 @@
     return Object.keys(DEFAULT_CONFIG).every((key) => left[key] === right[key]);
   }
 
-  function persistNormalizedValue(
+  function mergeConfigEdits(baseline, edited, latest) {
+    const original = normalizeConfig(baseline);
+    const local = normalizeConfig(edited);
+    const current = normalizeConfig(latest);
+    const merged = { ...current };
+    const conflicts = [];
+
+    Object.keys(DEFAULT_CONFIG).forEach((key) => {
+      if (local[key] === original[key]) return;
+      if (current[key] !== original[key] && current[key] !== local[key]) {
+        conflicts.push(key);
+        return;
+      }
+      merged[key] = local[key];
+    });
+
+    return { config: merged, conflicts };
+  }
+
+  async function persistNormalizedValue(
     storageKey,
     nextValue,
     { normalize, valuesEqual, setValue, getValue, errorMessage },
   ) {
     const normalized = normalize(nextValue);
-    setValue(storageKey, normalized);
-    const storedValue = getValue(storageKey, null);
+    await setValue(storageKey, normalized);
+    const storedValue = await getValue(storageKey, null);
     const stored = storedValue && typeof storedValue === 'object'
       ? normalize(storedValue)
       : null;
@@ -100,7 +121,7 @@
     return normalized;
   }
 
-  function persistConfig(storageKey, nextConfig, setValue, getValue) {
+  async function persistConfig(storageKey, nextConfig, setValue, getValue) {
     return persistNormalizedValue(
       storageKey,
       nextConfig,
@@ -135,7 +156,16 @@
     );
   }
 
-  function persistUiState(storageKey, nextState, setValue, getValue) {
+  function createSerializedUpdateQueue(runUpdate) {
+    let tail = Promise.resolve();
+    return (...args) => {
+      const result = tail.then(() => runUpdate(...args));
+      tail = result.catch(() => undefined);
+      return result;
+    };
+  }
+
+  async function persistUiState(storageKey, nextState, setValue, getValue) {
     return persistNormalizedValue(
       storageKey,
       nextState,
@@ -277,11 +307,13 @@
     globalThis.__BDF_TEST_EXPORTS__ = {
       contentSelector: CONTENT_SELECTOR,
       clampPanelPosition,
+      createSerializedUpdateQueue,
       extractCardText,
       findMatch,
       formatStatusText,
       isVideoDynamic,
       isDragGesture,
+      mergeConfigEdits,
       normalizeConfig,
       normalizeUiState,
       normalizeText,
@@ -322,6 +354,7 @@
   let previewButton;
   let videoPreviewButton;
   let activePanelDrag = false;
+  let compactSavePending = false;
   let suppressCompactClick = false;
   let closeConfigDialog = null;
   const pendingRoots = new Set();
@@ -335,29 +368,45 @@
     return normalizeUiState(GM_getValue(UI_STATE_KEY, DEFAULT_UI_STATE));
   }
 
-  function saveUiState(nextState) {
-    uiState = persistUiState(
+  const updateUiState = createSerializedUpdateQueue(async (patch) => {
+    const nextState = normalizeUiState({ ...uiState, ...patch });
+    if (uiStatesEqual(uiState, nextState)) return uiState;
+    uiState = await persistUiState(
       UI_STATE_KEY,
       nextState,
-      GM_setValue,
-      GM_getValue,
+      (key, value) => GM.setValue(key, value),
+      (key, fallback) => GM.getValue(key, fallback),
     );
     return uiState;
-  }
+  });
 
-  function saveConfig(nextConfig) {
-    const savedConfig = persistConfig(
-      CONFIG_KEY,
-      nextConfig,
-      GM_setValue,
-      GM_getValue,
-    );
-    config = savedConfig;
+  function applyConfig(nextConfig) {
+    config = normalizeConfig(nextConfig);
     parsedRules = parseRules(config.rulesText).rules;
     configRevision += 1;
     setBlockedContentPreview('none', false);
     scanRoot(document.body);
     updateStats();
+  }
+
+  const updateConfig = createSerializedUpdateQueue(async (resolveNextConfig) => {
+    const storedConfig = normalizeConfig(await GM.getValue(CONFIG_KEY, config));
+    const nextConfig = resolveNextConfig(storedConfig);
+    const savedConfig = await persistConfig(
+      CONFIG_KEY,
+      nextConfig,
+      (key, value) => GM.setValue(key, value),
+      (key, fallback) => GM.getValue(key, fallback),
+    );
+    applyConfig(savedConfig);
+    return config;
+  });
+
+  function saveConfig(nextConfigOrUpdater) {
+    const resolveNextConfig = typeof nextConfigOrUpdater === 'function'
+      ? nextConfigOrUpdater
+      : () => nextConfigOrUpdater;
+    return updateConfig(resolveNextConfig);
   }
 
   function canonicalCard(element) {
@@ -582,12 +631,16 @@
     ));
   }
 
-  function setStatusPanelCompact(compact) {
+  async function setStatusPanelCompact(compact) {
+    if (compactSavePending || uiState.compact === compact) return;
+    compactSavePending = true;
     try {
-      saveUiState({ ...uiState, compact });
+      await updateUiState({ compact });
     } catch (error) {
       console.error('[哔哩哔哩动态屏蔽] 状态面板显示模式保存失败', error);
       return;
+    } finally {
+      compactSavePending = false;
     }
 
     statusPanel.classList.toggle('bdf-compact', uiState.compact);
@@ -636,7 +689,7 @@
       event.preventDefault();
     });
 
-    const finishDrag = (event, persistPosition) => {
+    const finishDrag = async (event, persistPosition) => {
       if (!dragSession || event.pointerId !== dragSession.pointerId) return;
 
       const { moved } = dragSession;
@@ -663,7 +716,6 @@
         return;
       }
 
-      const previousState = uiState;
       const rect = statusPanel.getBoundingClientRect();
       const position = clampPanelPosition(
         { x: rect.left, y: rect.top },
@@ -671,15 +723,12 @@
         { width: rect.width, height: rect.height },
       );
       setStatusPanelPosition(position);
-      const nextState = {
-        ...uiState,
-        position: { x: Math.round(position.x), y: Math.round(position.y) },
-      };
-      if (uiStatesEqual(uiState, nextState)) return;
       try {
-        saveUiState(nextState);
+        await updateUiState({
+          position: { x: Math.round(position.x), y: Math.round(position.y) },
+        });
+        applyStatusPanelPosition();
       } catch (error) {
-        uiState = previousState;
         applyStatusPanelPosition();
         console.error('[哔哩哔哩动态屏蔽] 状态面板位置保存失败', error);
       }
@@ -746,7 +795,8 @@
   }
 
   function openConfigDialog() {
-    closeConfigDialog?.();
+    if (closeConfigDialog && closeConfigDialog() === false) return;
+    const openingConfig = { ...config };
 
     const overlay = document.createElement('div');
     overlay.id = 'bdf-overlay';
@@ -781,6 +831,17 @@
     const filterVideoInput = overlay.querySelector('#bdf-filter-video');
     const rulesInput = overlay.querySelector('#bdf-rules');
     const validation = overlay.querySelector('#bdf-validation');
+    const cancelButton = overlay.querySelector('[data-action="cancel"]');
+    const saveButton = overlay.querySelector('[data-action="save"]');
+    const editableControls = [
+      enabledInput,
+      showStatusInput,
+      filterVideoInput,
+      rulesInput,
+      cancelButton,
+      saveButton,
+    ];
+    let isSaving = false;
     enabledInput.checked = config.enabled;
     showStatusInput.checked = config.showStatusPanel;
     filterVideoInput.checked = config.filterVideoDynamics;
@@ -793,34 +854,52 @@
       return result.errors.length === 0;
     };
 
-    const close = () => {
+    const setSaving = (saving) => {
+      isSaving = saving;
+      editableControls.forEach((control) => {
+        control.disabled = saving;
+      });
+      saveButton.textContent = saving ? '正在保存…' : '保存并重新过滤';
+    };
+    const close = (force = false) => {
+      if (isSaving && !force) return false;
       document.removeEventListener('keydown', handleKeydown);
       overlay.remove();
       if (closeConfigDialog === close) closeConfigDialog = null;
+      return true;
     };
     const handleKeydown = (event) => {
       if (event.key === 'Escape') close();
     };
 
     rulesInput.addEventListener('input', validate);
-    overlay.querySelector('[data-action="cancel"]').addEventListener('click', close);
-    overlay.querySelector('[data-action="save"]').addEventListener('click', () => {
-      if (!validate()) return;
+    cancelButton.addEventListener('click', () => close());
+    saveButton.addEventListener('click', async () => {
+      if (isSaving || !validate()) return;
+      setSaving(true);
       try {
-        saveConfig({
+        const editedConfig = {
           enabled: enabledInput.checked,
           rulesText: rulesInput.value,
           showStatusPanel: showStatusInput.checked,
           filterVideoDynamics: filterVideoInput.checked,
+        };
+        await saveConfig((latestConfig) => {
+          const resolved = mergeConfigEdits(openingConfig, editedConfig, latestConfig);
+          if (resolved.conflicts.length > 0) {
+            throw new Error('配置已在其他标签页更新，当前修改与最新配置冲突；请复制修改内容，重新打开配置后再保存');
+          }
+          return resolved.config;
         });
       } catch (error) {
         validation.textContent = error instanceof Error
           ? error.message
           : '配置写入 Tampermonkey Storage 失败，请重试';
         validation.classList.add('bdf-error');
+        setSaving(false);
         return;
       }
-      close();
+      close(true);
     });
     overlay.addEventListener('click', (event) => {
       if (event.target === overlay) close();
@@ -832,9 +911,12 @@
     rulesInput.focus();
   }
 
-  function toggleFiltering() {
+  async function toggleFiltering() {
     try {
-      saveConfig({ ...config, enabled: !config.enabled });
+      await saveConfig((currentConfig) => ({
+        ...currentConfig,
+        enabled: !currentConfig.enabled,
+      }));
     } catch (error) {
       console.error('[哔哩哔哩动态屏蔽] 配置保存失败', error);
       window.alert('动态屏蔽开关保存失败，请打开配置页面重试。');
@@ -980,6 +1062,9 @@
 
   GM_registerMenuCommand('配置动态屏蔽规则', openConfigDialog);
   GM_registerMenuCommand('启用 / 暂停动态屏蔽', toggleFiltering);
+  GM_addValueChangeListener(CONFIG_KEY, (_key, _oldValue, newValue, remote) => {
+    if (remote) applyConfig(newValue);
+  });
 
   if (document.body) {
     boot();
