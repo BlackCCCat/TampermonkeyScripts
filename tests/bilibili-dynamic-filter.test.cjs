@@ -93,6 +93,60 @@ test('normalizes whitespace before matching', () => {
   assert.equal(findMatch('限时\n\t优惠', rules)?.source, '限时 优惠');
 });
 
+test('locates every case-insensitive keyword occurrence for preview highlighting', () => {
+  const { findMatchRanges } = loadTestApi();
+
+  assert.deepEqual(
+    Array.from(
+      findMatchRanges('广告 AD 广告', { type: 'keyword', source: '广告', flags: '' }),
+      (range) => ({ ...range }),
+    ),
+    [
+      { start: 0, end: 2 },
+      { start: 6, end: 8 },
+    ],
+  );
+
+  assert.deepEqual(
+    Array.from(
+      findMatchRanges('限时\n\t优惠', {
+        type: 'keyword',
+        source: '限时 优惠',
+        flags: '',
+      }),
+      (range) => ({ ...range }),
+    ),
+    [{ start: 0, end: 5 }],
+  );
+
+  assert.deepEqual(
+    Array.from(
+      findMatchRanges('İX', { type: 'keyword', source: 'x', flags: '' }),
+      (range) => ({ ...range }),
+    ),
+    [{ start: 1, end: 2 }],
+  );
+});
+
+test('locates every regular-expression occurrence for preview highlighting', () => {
+  const { findMatchRanges } = loadTestApi();
+
+  assert.deepEqual(
+    Array.from(
+      findMatchRanges('抽奖 送手机，再次抽奖送礼物', {
+        type: 'regex',
+        source: '抽奖\\s*送',
+        flags: 'i',
+      }),
+      (range) => ({ ...range }),
+    ),
+    [
+      { start: 0, end: 4 },
+      { start: 9, end: 12 },
+    ],
+  );
+});
+
 test('migrates existing configuration with the status panel enabled', () => {
   const { normalizeConfig } = loadTestApi();
 
@@ -209,6 +263,17 @@ test('clicking the active preview mode restores filtering', () => {
   assert.equal(togglePreviewMode('video', 'all'), 'all');
   assert.equal(togglePreviewMode('all', 'all'), 'none');
   assert.equal(togglePreviewMode('video', 'video'), 'none');
+});
+
+test('restores a missing preview highlight after a same-text rerender', () => {
+  const { highlightPiecesEqual, resolveHighlightAction } = loadTestApi();
+
+  assert.equal(resolveHighlightAction(true, false), 'add');
+  assert.equal(resolveHighlightAction(true, true), 'none');
+  assert.equal(resolveHighlightAction(false, true), 'remove');
+  assert.equal(resolveHighlightAction(false, false), 'none');
+  assert.equal(highlightPiecesEqual(['广告', '推广'], ['广告']), false);
+  assert.equal(highlightPiecesEqual(['广告', '推广'], ['广告', '推广']), true);
 });
 
 test('normalizes persisted status panel UI state', () => {

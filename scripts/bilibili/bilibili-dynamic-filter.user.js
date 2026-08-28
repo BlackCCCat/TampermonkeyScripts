@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.5.1
+// @version      0.5.2
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -58,14 +58,90 @@
   ].join(',');
   const normalizeText = (text) => String(text ?? '').replace(/\s+/g, ' ').trim();
 
-  function extractCardText(card) {
+  function normalizeTextWithOffsets(text) {
+    const value = String(text ?? '');
+    const offsets = [];
+    let normalized = '';
+    let whitespaceStart = -1;
+    let whitespaceEnd = -1;
+
+    const append = (chunk, start, end) => {
+      normalized += chunk;
+      for (let index = 0; index < chunk.length; index += 1) {
+        offsets.push({ start, end });
+      }
+    };
+
+    for (let index = 0; index < value.length;) {
+      const character = String.fromCodePoint(value.codePointAt(index));
+      const end = index + character.length;
+      if (/\s/u.test(character)) {
+        if (normalized && whitespaceStart === -1) whitespaceStart = index;
+        whitespaceEnd = end;
+      } else {
+        if (whitespaceStart !== -1) {
+          append(' ', whitespaceStart, whitespaceEnd);
+          whitespaceStart = -1;
+        }
+        append(character, index, end);
+      }
+      index = end;
+    }
+
+    return { text: normalized, offsets };
+  }
+
+  function getCardContentNodes(card) {
     const contentNodes = Array.from(card.querySelectorAll(CONTENT_SELECTOR));
     const outermostNodes = contentNodes.filter((node) => (
       !contentNodes.some((candidate) => candidate !== node && candidate.contains?.(node))
     ));
-    const nodes = outermostNodes.length > 0 ? outermostNodes : [card];
+    return outermostNodes.length > 0 ? outermostNodes : [card];
+  }
+
+  function buildCardTextIndex(card) {
+    const contentNodes = getCardContentNodes(card);
+    const text = normalizeText(
+      contentNodes
+        .map((node) => node.innerText || node.textContent || '')
+        .join(' '),
+    );
+    if (typeof document === 'undefined') return { text, segments: [] };
+
+    const segments = [];
+    let contentStart = 0;
+    contentNodes.forEach((contentNode) => {
+      const contentText = normalizeText(
+        contentNode.innerText || contentNode.textContent || '',
+      );
+      if (!contentText) return;
+
+      const start = text.indexOf(contentText, contentStart);
+      if (start === -1) return;
+      let nodeStart = 0;
+      const walker = document.createTreeWalker(contentNode, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        const normalizedNode = normalizeTextWithOffsets(walker.currentNode.data);
+        if (!normalizedNode.text) continue;
+        const offset = contentText.indexOf(normalizedNode.text, nodeStart);
+        if (offset === -1) continue;
+        segments.push({
+          node: walker.currentNode,
+          start: start + offset,
+          end: start + offset + normalizedNode.text.length,
+          offsets: normalizedNode.offsets,
+        });
+        nodeStart = offset + normalizedNode.text.length;
+      }
+      contentStart = start + contentText.length;
+    });
+
+    return { text, segments };
+  }
+
+  function extractCardText(card) {
     return normalizeText(
-      nodes
+      getCardContentNodes(card)
         .map((node) => node.innerText || node.textContent || '')
         .join(' '),
     );
@@ -303,6 +379,67 @@
     return null;
   }
 
+  function findMatchRanges(text, match) {
+    const value = normalizeText(text);
+    const ranges = [];
+    if (!match?.source) return ranges;
+
+    if (match.type === 'keyword') {
+      const foldedValue = foldTextWithOffsets(value);
+      const keyword = normalizeText(match.source).toLocaleLowerCase();
+      if (!keyword) return ranges;
+      let start = 0;
+      while ((start = foldedValue.text.indexOf(keyword, start)) !== -1) {
+        const firstOffset = foldedValue.offsets[start];
+        const lastOffset = foldedValue.offsets[start + keyword.length - 1];
+        if (firstOffset && lastOffset) {
+          ranges.push({ start: firstOffset.start, end: lastOffset.end });
+        }
+        start += keyword.length;
+      }
+      return ranges;
+    }
+
+    const ruleFlags = match.flags || '';
+    const flags = ruleFlags.includes('g') ? ruleFlags : `${ruleFlags}g`;
+    const matcher = new RegExp(match.source, flags);
+    for (const result of value.matchAll(matcher)) {
+      if (!result[0]) continue;
+      ranges.push({ start: result.index, end: result.index + result[0].length });
+    }
+    return ranges;
+  }
+
+  function foldTextWithOffsets(text) {
+    const value = String(text ?? '');
+    const folded = value.toLocaleLowerCase();
+    const offsets = [];
+
+    for (let index = 0; index < value.length;) {
+      const character = String.fromCodePoint(value.codePointAt(index));
+      const end = index + character.length;
+      const foldedLength = character.toLocaleLowerCase().length;
+      for (let offset = 0; offset < foldedLength; offset += 1) {
+        offsets.push({ start: index, end });
+      }
+      index = end;
+    }
+
+    return { text: folded, offsets };
+  }
+
+  function resolveHighlightAction(shouldHighlight, hasHighlight) {
+    if (shouldHighlight === hasHighlight) return 'none';
+    return shouldHighlight ? 'add' : 'remove';
+  }
+
+  function highlightPiecesEqual(expectedPieces, actualPieces) {
+    return (
+      expectedPieces.length === actualPieces.length &&
+      expectedPieces.every((piece, index) => piece === actualPieces[index])
+    );
+  }
+
   if (globalThis.__BDF_TEST_MODE__) {
     globalThis.__BDF_TEST_EXPORTS__ = {
       contentSelector: CONTENT_SELECTOR,
@@ -310,7 +447,9 @@
       createSerializedUpdateQueue,
       extractCardText,
       findMatch,
+      findMatchRanges,
       formatStatusText,
+      highlightPiecesEqual,
       isVideoDynamic,
       isDragGesture,
       mergeConfigEdits,
@@ -320,6 +459,7 @@
       parseRules,
       persistConfig,
       persistUiState,
+      resolveHighlightAction,
       resolvePreviewMode,
       shouldHideMatchedCard,
       shouldShowStatusPanel,
@@ -338,6 +478,7 @@
   const VIDEO_MATCH_CLASS = 'bdf-matched-video-dynamic';
   const PREVIEW_CLASS = 'bdf-show-blocked-content';
   const VIDEO_PREVIEW_CLASS = 'bdf-show-blocked-videos';
+  const HIGHLIGHT_SELECTOR = '[data-bdf-match-highlight]';
   const OWNED_UI_SELECTOR = '#bdf-status, #bdf-overlay';
 
   let config = loadConfig();
@@ -418,6 +559,109 @@
     );
   }
 
+  function clearCardMatchHighlights(card) {
+    card.querySelectorAll(HIGHLIGHT_SELECTOR).forEach((highlight) => {
+      const parent = highlight.parentNode;
+      highlight.replaceWith(highlight.textContent || '');
+      parent?.normalize();
+    });
+  }
+
+  function getCardHighlightPieces(card, match) {
+    if (!match) return [];
+
+    const textIndex = buildCardTextIndex(card);
+    const matchRanges = findMatchRanges(textIndex.text, match);
+    return textIndex.segments.flatMap((segment) => (
+      matchRanges.flatMap((range) => {
+        const normalizedStart = Math.max(range.start, segment.start);
+        const normalizedEnd = Math.min(range.end, segment.end);
+        if (normalizedStart >= normalizedEnd) return [];
+        const firstOffset = segment.offsets[normalizedStart - segment.start];
+        const lastOffset = segment.offsets[normalizedEnd - segment.start - 1];
+        return [{
+          node: segment.node,
+          start: firstOffset.start,
+          end: lastOffset.end,
+        }];
+      })
+    ));
+  }
+
+  function highlightCardMatch(card, match) {
+    clearCardMatchHighlights(card);
+    if (!match) return;
+
+    const piecesByNode = new Map();
+    getCardHighlightPieces(card, match).forEach((piece) => {
+      if (!piecesByNode.has(piece.node)) piecesByNode.set(piece.node, []);
+      piecesByNode.get(piece.node).push(piece);
+    });
+    piecesByNode.forEach((pieces, node) => {
+      pieces.reverse().forEach(({ start, end }) => {
+        node.splitText(end);
+        const matchedText = node.splitText(start);
+        const highlight = document.createElement('mark');
+        highlight.dataset.bdfMatchHighlight = '';
+        highlight.textContent = matchedText.data;
+        matchedText.replaceWith(highlight);
+      });
+    });
+  }
+
+  function shouldHighlightCard(card) {
+    if (!card.classList.contains(HIDDEN_CLASS)) return false;
+    return (
+      previewMode === 'all' ||
+      (previewMode === 'video' && card.classList.contains(VIDEO_MATCH_CLASS))
+    );
+  }
+
+  function hasCompleteCardMatchHighlight(card, match) {
+    const expectedPieces = getCardHighlightPieces(card, match).map(
+      ({ node, start, end }) => node.data.slice(start, end),
+    );
+    const actualPieces = Array.from(
+      card.querySelectorAll(HIGHLIGHT_SELECTOR),
+      (highlight) => highlight.textContent || '',
+    );
+    return highlightPiecesEqual(expectedPieces, actualPieces);
+  }
+
+  function reconcileCardMatchHighlight(card, match) {
+    const shouldHighlight = shouldHighlightCard(card);
+    const action = resolveHighlightAction(
+      shouldHighlight,
+      shouldHighlight
+        ? hasCompleteCardMatchHighlight(card, match)
+        : Boolean(card.querySelector(HIGHLIGHT_SELECTOR)),
+    );
+    if (action === 'add') highlightCardMatch(card, match);
+    if (action === 'remove') clearCardMatchHighlights(card);
+  }
+
+  function syncMatchHighlights() {
+    const highlightedCards = new Set(
+      Array.from(document.querySelectorAll(HIGHLIGHT_SELECTOR), canonicalCard)
+        .filter(Boolean),
+    );
+    const targetCards = new Set();
+    if (previewMode !== 'none') {
+      document.querySelectorAll(`.${HIDDEN_CLASS}`).forEach((card) => {
+        if (shouldHighlightCard(card)) targetCards.add(card);
+      });
+    }
+
+    highlightedCards.forEach((card) => {
+      if (!targetCards.has(card)) clearCardMatchHighlights(card);
+    });
+    targetCards.forEach((card) => {
+      if (!highlightedCards.has(card)) {
+        highlightCardMatch(card, cardState.get(card)?.match);
+      }
+    });
+  }
+
   function filterCard(card) {
     if (!(card instanceof Element)) return;
 
@@ -428,14 +672,18 @@
       previous?.revision === configRevision &&
       previous.text === text &&
       previous.videoDynamic === videoDynamic
-    ) return;
+    ) {
+      reconcileCardMatchHighlight(card, previous.match);
+      return;
+    }
 
-    cardState.set(card, { revision: configRevision, text, videoDynamic });
     const match = config.enabled && parsedRules.length > 0
       ? findMatch(text, parsedRules)
       : null;
+    cardState.set(card, { revision: configRevision, text, videoDynamic, match });
 
     if (!match) {
+      clearCardMatchHighlights(card);
       card.classList.remove(HIDDEN_CLASS);
       card.classList.remove(VIDEO_MATCH_CLASS);
       card.style.removeProperty('--bdf-original-display');
@@ -449,6 +697,7 @@
     card.dataset.bdfRuleType = match.type;
 
     if (!shouldHideMatchedCard(videoDynamic, config.filterVideoDynamics)) {
+      clearCardMatchHighlights(card);
       card.classList.remove(HIDDEN_CLASS);
       card.style.removeProperty('--bdf-original-display');
       return;
@@ -461,6 +710,7 @@
       }
     }
     card.classList.add(HIDDEN_CLASS);
+    reconcileCardMatchHighlight(card, match);
   }
 
   function scanRoot(root) {
@@ -603,6 +853,7 @@
       VIDEO_PREVIEW_CLASS,
       previewMode === 'video',
     );
+    syncMatchHighlights();
     if (refreshStats) updateStats();
   }
 
@@ -940,6 +1191,9 @@
       }
       html.${VIDEO_PREVIEW_CLASS} .${HIDDEN_CLASS}.${VIDEO_MATCH_CLASS}::before {
         content: "已屏蔽的视频动态"; background: #00aeec;
+      }
+      ${HIGHLIGHT_SELECTOR} {
+        color: #d83a52 !important; background: transparent; pointer-events: none;
       }
       #bdf-status {
         position: fixed; right: 24px; bottom: 24px; z-index: 99998;
