@@ -129,7 +129,7 @@ test('locates every case-insensitive keyword occurrence for preview highlighting
 });
 
 test('locates every regular-expression occurrence for preview highlighting', () => {
-  const { findMatchRanges } = loadTestApi();
+  const { findMatch, findMatchRanges, parseRules } = loadTestApi();
 
   assert.deepEqual(
     Array.from(
@@ -143,6 +143,18 @@ test('locates every regular-expression occurrence for preview highlighting', () 
     [
       { start: 0, end: 4 },
       { start: 9, end: 12 },
+    ],
+  );
+
+  const text = '今天美团可以下单';
+  const { rules } = parseRules(
+    '/^(?!.*(?:不是广告))(?:(?=.*(?:广告|推广))|(?=.*(?:美团|淘宝|省钱(快|块|海)报))(?=.*(?:下单|优惠)))[\\s\\S]+$/i',
+  );
+  assert.deepEqual(
+    Array.from(findMatchRanges(text, findMatch(text, rules)), (range) => ({ ...range })),
+    [
+      { start: 2, end: 4 },
+      { start: 6, end: 8 },
     ],
   );
 });
@@ -376,6 +388,31 @@ test('waits for configuration storage before verifying the saved value', async (
 
   assert.equal(storage.get('config-key').filterVideoDynamics, false);
   assert.deepEqual({ ...saved }, { ...storage.get('config-key') });
+});
+
+test('loads the latest configuration through the asynchronous storage API', async () => {
+  const { readStoredState } = loadTestApi();
+  let finishConfigRead;
+  const configRead = new Promise((resolve) => {
+    finishConfigRead = resolve;
+  });
+  const loading = readStoredState((key) => (
+    key.includes(':config:')
+      ? configRead
+      : Promise.resolve({ compact: true, position: null })
+  ));
+  let settled = false;
+  loading.then(() => {
+    settled = true;
+  });
+
+  await Promise.resolve();
+  assert.equal(settled, false);
+  finishConfigRead({ enabled: true, rulesText: '最新规则' });
+  const stored = await loading;
+
+  assert.equal(stored.config.rulesText, '最新规则');
+  assert.equal(stored.uiState.compact, true);
 });
 
 test('reports a storage write that cannot be read back', async () => {

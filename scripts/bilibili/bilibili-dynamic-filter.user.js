@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.5.2
+// @version      0.5.3
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -14,8 +14,7 @@
 // @icon         https://www.bilibili.com/favicon.ico
 // @grant        GM_addStyle
 // @grant        GM.getValue
-// @grant        GM_getValue
-// @grant        GM_addValueChangeListener
+// @grant        GM.addValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        GM.setValue
 // @run-at       document-idle
@@ -255,6 +254,17 @@
     );
   }
 
+  async function readStoredState(getValue) {
+    const [storedConfig, storedUiState] = await Promise.all([
+      getValue(CONFIG_KEY, DEFAULT_CONFIG),
+      getValue(UI_STATE_KEY, DEFAULT_UI_STATE),
+    ]);
+    return {
+      config: normalizeConfig(storedConfig),
+      uiState: normalizeUiState(storedUiState),
+    };
+  }
+
   function clampPanelPosition(position, viewport, panel, margin = 8) {
     const maxX = Math.max(margin, viewport.width - panel.width - margin);
     const maxY = Math.max(margin, viewport.height - panel.height - margin);
@@ -400,6 +410,9 @@
       return ranges;
     }
 
+    const lookaheadRanges = findPositiveLookaheadRanges(value, match);
+    if (lookaheadRanges.length > 0) return lookaheadRanges;
+
     const ruleFlags = match.flags || '';
     const flags = ruleFlags.includes('g') ? ruleFlags : `${ruleFlags}g`;
     const matcher = new RegExp(match.source, flags);
@@ -408,6 +421,69 @@
       ranges.push({ start: result.index, end: result.index + result[0].length });
     }
     return ranges;
+  }
+
+  function findRegexGroupEnd(source, start) {
+    let depth = 0;
+    let escaped = false;
+    let inCharacterClass = false;
+
+    for (let index = start; index < source.length; index += 1) {
+      const character = source[index];
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (character === '\\') {
+        escaped = true;
+        continue;
+      }
+      if (character === '[') inCharacterClass = true;
+      if (character === ']' && inCharacterClass) inCharacterClass = false;
+      if (inCharacterClass) continue;
+      if (character === '(') depth += 1;
+      if (character === ')' && --depth === 0) return index;
+    }
+    return -1;
+  }
+
+  function extractPositiveLookaheadPatterns(source) {
+    const patterns = [];
+    for (let index = 0; index < source.length - 2; index += 1) {
+      if (!source.startsWith('(?=', index)) continue;
+      const end = findRegexGroupEnd(source, index);
+      if (end === -1) continue;
+      const body = source.slice(index + 3, end);
+      const candidate = body.replace(/^(?:\.\*\??|\[\\s\\S\]\*\??)/, '');
+      if (candidate && !/^\(\?[=!]/.test(candidate)) patterns.push(candidate);
+    }
+    return patterns;
+  }
+
+  function findPositiveLookaheadRanges(text, match) {
+    const ranges = [];
+    const flags = `${(match.flags || '').replace(/[gyd]/g, '')}g`;
+    extractPositiveLookaheadPatterns(match.source).forEach((pattern) => {
+      let matcher;
+      try {
+        matcher = new RegExp(pattern, flags);
+      } catch (_error) {
+        return;
+      }
+      for (const result of text.matchAll(matcher)) {
+        if (!result[0]) continue;
+        ranges.push({ start: result.index, end: result.index + result[0].length });
+      }
+    });
+
+    return ranges
+      .sort((left, right) => left.start - right.start || right.end - left.end)
+      .reduce((merged, range) => {
+        const previous = merged[merged.length - 1];
+        if (!previous || range.start >= previous.end) merged.push({ ...range });
+        else if (range.end > previous.end) previous.end = range.end;
+        return merged;
+      }, []);
   }
 
   function foldTextWithOffsets(text) {
@@ -459,6 +535,7 @@
       parseRules,
       persistConfig,
       persistUiState,
+      readStoredState,
       resolveHighlightAction,
       resolvePreviewMode,
       shouldHideMatchedCard,
@@ -481,8 +558,8 @@
   const HIGHLIGHT_SELECTOR = '[data-bdf-match-highlight]';
   const OWNED_UI_SELECTOR = '#bdf-status, #bdf-overlay';
 
-  let config = loadConfig();
-  let uiState = loadUiState();
+  let config = normalizeConfig(DEFAULT_CONFIG);
+  let uiState = normalizeUiState(DEFAULT_UI_STATE);
   let parsedRules = parseRules(config.rulesText).rules;
   let configRevision = 0;
   let pendingTimer;
@@ -501,14 +578,6 @@
   const pendingRoots = new Set();
   const cardState = new WeakMap();
 
-  function loadConfig() {
-    return normalizeConfig(GM_getValue(CONFIG_KEY, DEFAULT_CONFIG));
-  }
-
-  function loadUiState() {
-    return normalizeUiState(GM_getValue(UI_STATE_KEY, DEFAULT_UI_STATE));
-  }
-
   const updateUiState = createSerializedUpdateQueue(async (patch) => {
     const nextState = normalizeUiState({ ...uiState, ...patch });
     if (uiStatesEqual(uiState, nextState)) return uiState;
@@ -522,7 +591,9 @@
   });
 
   function applyConfig(nextConfig) {
-    config = normalizeConfig(nextConfig);
+    const normalizedConfig = normalizeConfig(nextConfig);
+    if (configsEqual(config, normalizedConfig)) return;
+    config = normalizedConfig;
     parsedRules = parseRules(config.rulesText).rules;
     configRevision += 1;
     setBlockedContentPreview('none', false);
@@ -1045,8 +1116,13 @@
     return errors.length > 0 ? errors.join('\n') : '规则格式正确';
   }
 
-  function openConfigDialog() {
+  async function openConfigDialog() {
     if (closeConfigDialog && closeConfigDialog() === false) return;
+    try {
+      applyConfig(await GM.getValue(CONFIG_KEY, config));
+    } catch (error) {
+      console.error('[哔哩哔哩动态屏蔽] 打开配置前读取 Storage 失败', error);
+    }
     const openingConfig = { ...config };
 
     const overlay = document.createElement('div');
@@ -1068,7 +1144,7 @@
         </label>
         <label for="bdf-rules">屏蔽规则（每行一条）</label>
         <textarea id="bdf-rules" spellcheck="false" placeholder="广告\n/抽奖|推广/i"></textarea>
-        <p class="bdf-help">普通文本按关键字匹配（不区分大小写）；以 <code>/表达式/标志</code> 书写正则；以 <code>#</code> 开头的行是注释。</p>
+        <p class="bdf-help">普通文本按关键字匹配（不区分大小写）；以 <code>/表达式/标志</code> 书写正则；正则含正向前瞻时，查看模式优先标红其中实际命中的词；以 <code>#</code> 开头的行是注释。</p>
         <pre id="bdf-validation" aria-live="polite"></pre>
         <div class="bdf-actions">
           <button type="button" data-action="cancel">取消</button>
@@ -1298,7 +1374,18 @@
     `);
   }
 
-  function boot() {
+  async function boot() {
+    try {
+      const stored = await readStoredState(
+        (key, fallback) => GM.getValue(key, fallback),
+      );
+      config = stored.config;
+      uiState = stored.uiState;
+      parsedRules = parseRules(config.rulesText).rules;
+    } catch (error) {
+      console.error('[哔哩哔哩动态屏蔽] 读取 Tampermonkey Storage 失败', error);
+    }
+
     installStyles();
     createStatusPanel();
     scanRoot(document.body);
@@ -1312,17 +1399,22 @@
         applyStatusPanelPosition();
       });
     });
+
+    GM_registerMenuCommand('配置动态屏蔽规则', openConfigDialog);
+    GM_registerMenuCommand('启用 / 暂停动态屏蔽', toggleFiltering);
+    try {
+      await GM.addValueChangeListener(CONFIG_KEY, (_key, _oldValue, newValue) => {
+        applyConfig(newValue);
+      });
+      applyConfig(await GM.getValue(CONFIG_KEY, config));
+    } catch (error) {
+      console.error('[哔哩哔哩动态屏蔽] 监听 Tampermonkey Storage 失败', error);
+    }
   }
 
-  GM_registerMenuCommand('配置动态屏蔽规则', openConfigDialog);
-  GM_registerMenuCommand('启用 / 暂停动态屏蔽', toggleFiltering);
-  GM_addValueChangeListener(CONFIG_KEY, (_key, _oldValue, newValue, remote) => {
-    if (remote) applyConfig(newValue);
-  });
-
   if (document.body) {
-    boot();
+    void boot();
   } else {
-    window.addEventListener('DOMContentLoaded', boot, { once: true });
+    window.addEventListener('DOMContentLoaded', () => void boot(), { once: true });
   }
 })();
