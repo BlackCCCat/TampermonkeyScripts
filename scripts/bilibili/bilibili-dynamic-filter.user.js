@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.5.3
+// @version      0.5.4
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -29,6 +29,7 @@
     rulesText: '',
     showStatusPanel: true,
     filterVideoDynamics: true,
+    showQuickBlockButton: true,
   });
   const DEFAULT_UI_STATE = Object.freeze({
     compact: false,
@@ -153,6 +154,7 @@
       rulesText: typeof stored.rulesText === 'string' ? stored.rulesText : '',
       showStatusPanel: stored.showStatusPanel !== false,
       filterVideoDynamics: stored.filterVideoDynamics !== false,
+      showQuickBlockButton: stored.showQuickBlockButton !== false,
     };
   }
 
@@ -208,6 +210,19 @@
         errorMessage: '配置写入 Tampermonkey Storage 后校验失败，请重试',
       },
     );
+  }
+
+  async function updateStoredConfig(
+    storageKey,
+    fallbackConfig,
+    resolveNextConfig,
+    setValue,
+    getValue,
+  ) {
+    const storedConfig = normalizeConfig(await getValue(storageKey, fallbackConfig));
+    const nextConfig = normalizeConfig(resolveNextConfig(storedConfig));
+    if (configsEqual(storedConfig, nextConfig)) return storedConfig;
+    return persistConfig(storageKey, nextConfig, setValue, getValue);
   }
 
   function normalizeUiState(stored) {
@@ -361,6 +376,75 @@
       });
 
     return { rules, errors };
+  }
+
+  function appendQuickBlockKeyword(rulesText, input, cardText) {
+    const keyword = normalizeText(input);
+    const currentRulesText = String(rulesText ?? '').trimEnd();
+    if (!keyword) {
+      return { rulesText: currentRulesText, keyword, added: false, error: '关键词不能为空' };
+    }
+    if (keyword.length > 80) {
+      return { rulesText: currentRulesText, keyword, added: false, error: '关键词不能超过 80 个字符' };
+    }
+    if (keyword.startsWith('#') || keyword.startsWith('/')) {
+      return {
+        rulesText: currentRulesText,
+        keyword,
+        added: false,
+        error: '快捷屏蔽只支持普通关键词，且不能以 # 或 / 开头',
+      };
+    }
+    if (!normalizeText(cardText).toLocaleLowerCase().includes(keyword.toLocaleLowerCase())) {
+      return {
+        rulesText: currentRulesText,
+        keyword,
+        added: false,
+        error: '当前动态不包含这个关键词，请重新选择',
+      };
+    }
+
+    const exists = parseRules(currentRulesText).rules.some((rule) => (
+      rule.type === 'keyword' &&
+      rule.keyword === keyword.toLocaleLowerCase()
+    ));
+    return {
+      rulesText: exists
+        ? currentRulesText
+        : [currentRulesText, keyword].filter(Boolean).join('\n'),
+      keyword,
+      added: !exists,
+      error: '',
+    };
+  }
+
+  function resolveQuickBlockUpdate(
+    currentConfig,
+    input,
+    cardText,
+    videoDynamic,
+    confirmEnableVideoFiltering,
+  ) {
+    const normalizedConfig = normalizeConfig(currentConfig);
+    const result = appendQuickBlockKeyword(normalizedConfig.rulesText, input, cardText);
+    if (result.error) return { config: normalizedConfig, result, cancelled: false };
+
+    const videoFilteringRequired = videoDynamic && !normalizedConfig.filterVideoDynamics;
+    if (videoFilteringRequired && !confirmEnableVideoFiltering()) {
+      return { config: normalizedConfig, result, cancelled: true };
+    }
+    if (!result.added && !videoFilteringRequired) {
+      return { config: normalizedConfig, result, cancelled: false };
+    }
+    return {
+      config: {
+        ...normalizedConfig,
+        rulesText: result.rulesText,
+        filterVideoDynamics: normalizedConfig.filterVideoDynamics || videoFilteringRequired,
+      },
+      result,
+      cancelled: false,
+    };
   }
 
   function findMatch(text, rules) {
@@ -519,6 +603,7 @@
   if (globalThis.__BDF_TEST_MODE__) {
     globalThis.__BDF_TEST_EXPORTS__ = {
       contentSelector: CONTENT_SELECTOR,
+      appendQuickBlockKeyword,
       clampPanelPosition,
       createSerializedUpdateQueue,
       extractCardText,
@@ -536,11 +621,13 @@
       persistConfig,
       persistUiState,
       readStoredState,
+      resolveQuickBlockUpdate,
       resolveHighlightAction,
       resolvePreviewMode,
       shouldHideMatchedCard,
       shouldShowStatusPanel,
       togglePreviewMode,
+      updateStoredConfig,
       videoSelector: VIDEO_SELECTOR,
     };
     return;
@@ -556,7 +643,9 @@
   const PREVIEW_CLASS = 'bdf-show-blocked-content';
   const VIDEO_PREVIEW_CLASS = 'bdf-show-blocked-videos';
   const HIGHLIGHT_SELECTOR = '[data-bdf-match-highlight]';
-  const OWNED_UI_SELECTOR = '#bdf-status, #bdf-overlay';
+  const QUICK_BLOCK_SELECTOR = '[data-bdf-quick-block]';
+  const QUICK_BLOCK_HOST_CLASS = 'bdf-quick-block-host';
+  const OWNED_UI_SELECTOR = `#bdf-status, #bdf-overlay, ${QUICK_BLOCK_SELECTOR}`;
 
   let config = normalizeConfig(DEFAULT_CONFIG);
   let uiState = normalizeUiState(DEFAULT_UI_STATE);
@@ -602,11 +691,10 @@
   }
 
   const updateConfig = createSerializedUpdateQueue(async (resolveNextConfig) => {
-    const storedConfig = normalizeConfig(await GM.getValue(CONFIG_KEY, config));
-    const nextConfig = resolveNextConfig(storedConfig);
-    const savedConfig = await persistConfig(
+    const savedConfig = await updateStoredConfig(
       CONFIG_KEY,
-      nextConfig,
+      config,
+      resolveNextConfig,
       (key, value) => GM.setValue(key, value),
       (key, fallback) => GM.getValue(key, fallback),
     );
@@ -733,8 +821,78 @@
     });
   }
 
+  function selectedTextInsideCard(card) {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) return '';
+    const range = selection.getRangeAt(0);
+    if (!card.contains(range.commonAncestorContainer)) return '';
+    return normalizeText(selection.toString()).slice(0, 80);
+  }
+
+  async function quickBlockCard(card) {
+    const input = window.prompt(
+      '输入要加入屏蔽列表的关键词（可以先选中动态里的文字再点击“屏蔽”）',
+      selectedTextInsideCard(card),
+    );
+    if (input === null) return;
+
+    const cardText = extractCardText(card);
+    const videoDynamic = isVideoDynamic(card);
+
+    let outcome;
+    try {
+      await saveConfig((currentConfig) => {
+        outcome = resolveQuickBlockUpdate(
+          currentConfig,
+          input,
+          cardText,
+          videoDynamic,
+          () => window.confirm(
+            '当前已关闭视频动态过滤。是否同时开启，并屏蔽这条视频动态？',
+          ),
+        );
+        if (outcome.result.error) throw new Error(outcome.result.error);
+        return outcome.config;
+      });
+      if (outcome.cancelled) return;
+      if (!outcome.result.added) {
+        window.alert(`“${outcome.result.keyword}”已经在屏蔽列表中`);
+      }
+    } catch (error) {
+      window.alert(error instanceof Error ? error.message : '快捷屏蔽保存失败，请重试');
+    }
+  }
+
+  function syncQuickBlockButton(card) {
+    const existingButton = Array.from(card.children).find(
+      (child) => child.matches(QUICK_BLOCK_SELECTOR),
+    );
+    if (!config.enabled || !config.showQuickBlockButton) {
+      existingButton?.remove();
+      card.classList.remove(QUICK_BLOCK_HOST_CLASS);
+      return;
+    }
+    if (existingButton) return;
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.dataset.bdfQuickBlock = '';
+    button.setAttribute('aria-label', '选择关键词屏蔽这条动态');
+    button.title = '选择关键词屏蔽这条动态';
+    button.addEventListener('pointerdown', (event) => event.preventDefault());
+    button.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      void quickBlockCard(card);
+    });
+    card.classList.add(QUICK_BLOCK_HOST_CLASS);
+    card.append(button);
+  }
+
   function filterCard(card) {
     if (!(card instanceof Element)) return;
+
+    syncQuickBlockButton(card);
 
     const text = extractCardText(card);
     const videoDynamic = isVideoDynamic(card);
@@ -1142,6 +1300,10 @@
           <input id="bdf-filter-video" type="checkbox">
           过滤视频动态（关闭后仍统计命中数量）
         </label>
+        <label class="bdf-switch-row">
+          <input id="bdf-show-quick-block" type="checkbox">
+          在每条动态右上角显示“屏蔽”按钮
+        </label>
         <label for="bdf-rules">屏蔽规则（每行一条）</label>
         <textarea id="bdf-rules" spellcheck="false" placeholder="广告\n/抽奖|推广/i"></textarea>
         <p class="bdf-help">普通文本按关键字匹配（不区分大小写）；以 <code>/表达式/标志</code> 书写正则；正则含正向前瞻时，查看模式优先标红其中实际命中的词；以 <code>#</code> 开头的行是注释。</p>
@@ -1156,6 +1318,7 @@
     const enabledInput = overlay.querySelector('#bdf-enabled');
     const showStatusInput = overlay.querySelector('#bdf-show-status');
     const filterVideoInput = overlay.querySelector('#bdf-filter-video');
+    const showQuickBlockInput = overlay.querySelector('#bdf-show-quick-block');
     const rulesInput = overlay.querySelector('#bdf-rules');
     const validation = overlay.querySelector('#bdf-validation');
     const cancelButton = overlay.querySelector('[data-action="cancel"]');
@@ -1164,6 +1327,7 @@
       enabledInput,
       showStatusInput,
       filterVideoInput,
+      showQuickBlockInput,
       rulesInput,
       cancelButton,
       saveButton,
@@ -1172,6 +1336,7 @@
     enabledInput.checked = config.enabled;
     showStatusInput.checked = config.showStatusPanel;
     filterVideoInput.checked = config.filterVideoDynamics;
+    showQuickBlockInput.checked = config.showQuickBlockButton;
     rulesInput.value = config.rulesText;
 
     const validate = () => {
@@ -1210,6 +1375,7 @@
           rulesText: rulesInput.value,
           showStatusPanel: showStatusInput.checked,
           filterVideoDynamics: filterVideoInput.checked,
+          showQuickBlockButton: showQuickBlockInput.checked,
         };
         await saveConfig((latestConfig) => {
           const resolved = mergeConfigEdits(openingConfig, editedConfig, latestConfig);
@@ -1271,6 +1437,18 @@
       ${HIGHLIGHT_SELECTOR} {
         color: #d83a52 !important; background: transparent; pointer-events: none;
       }
+      .${QUICK_BLOCK_HOST_CLASS} { position: relative; }
+      ${QUICK_BLOCK_SELECTOR} {
+        position: absolute; top: 12px; right: 44px; z-index: 4;
+        min-width: 42px; height: 25px; box-sizing: border-box;
+        border: 1px solid rgb(251 114 153 / 55%); border-radius: 13px; padding: 0 8px;
+        color: #fb7299; background: rgb(255 255 255 / 90%); cursor: pointer;
+        opacity: .72; font: 12px/23px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      ${QUICK_BLOCK_SELECTOR}::before { content: "屏蔽"; }
+      ${QUICK_BLOCK_SELECTOR}:hover,
+      ${QUICK_BLOCK_SELECTOR}:focus-visible { opacity: 1; color: #fff; background: #fb7299; }
+      .${HIDDEN_CLASS} > ${QUICK_BLOCK_SELECTOR} { display: none !important; }
       #bdf-status {
         position: fixed; right: 24px; bottom: 24px; z-index: 99998;
         width: 252px; min-width: 0; max-width: calc(100vw - 16px); box-sizing: border-box;

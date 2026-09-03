@@ -169,6 +169,7 @@ test('migrates existing configuration with the status panel enabled', () => {
       rulesText: '广告',
       showStatusPanel: true,
       filterVideoDynamics: true,
+      showQuickBlockButton: true,
     },
   );
 });
@@ -185,6 +186,67 @@ test('preserves an explicitly disabled video filtering setting', () => {
 
   assert.equal(normalizeConfig({ filterVideoDynamics: false }).filterVideoDynamics, false);
   assert.equal(normalizeConfig(null).filterVideoDynamics, true);
+});
+
+test('enables the per-dynamic quick block button by default', () => {
+  const { normalizeConfig } = loadTestApi();
+
+  assert.equal(normalizeConfig({}).showQuickBlockButton, true);
+  assert.equal(normalizeConfig({ showQuickBlockButton: false }).showQuickBlockButton, false);
+});
+
+test('appends a matching quick-block keyword once', () => {
+  const { appendQuickBlockKeyword } = loadTestApi();
+
+  assert.deepEqual(
+    { ...appendQuickBlockKeyword('广告', ' 美团 ', '今天美团有优惠') },
+    { rulesText: '广告\n美团', keyword: '美团', added: true, error: '' },
+  );
+  assert.deepEqual(
+    { ...appendQuickBlockKeyword('广告\n美团', '美团', '今天美团有优惠') },
+    { rulesText: '广告\n美团', keyword: '美团', added: false, error: '' },
+  );
+});
+
+test('rejects unsafe or unrelated quick-block keywords', () => {
+  const { appendQuickBlockKeyword } = loadTestApi();
+
+  assert.match(appendQuickBlockKeyword('', '', '正文').error, /不能为空/);
+  assert.match(appendQuickBlockKeyword('', '# 注释', '# 注释').error, /不能以/);
+  assert.match(appendQuickBlockKeyword('', '/广告/i', '/广告/i').error, /普通关键词/);
+  assert.match(appendQuickBlockKeyword('', '淘宝', '美团优惠').error, /当前动态不包含/);
+});
+
+test('requires confirmation before quick-block enables video filtering', () => {
+  const { resolveQuickBlockUpdate } = loadTestApi();
+  const current = {
+    enabled: true,
+    rulesText: '广告',
+    showStatusPanel: true,
+    filterVideoDynamics: false,
+    showQuickBlockButton: true,
+  };
+  const declined = resolveQuickBlockUpdate(
+    current,
+    '美团',
+    '美团优惠',
+    true,
+    () => false,
+  );
+  const accepted = resolveQuickBlockUpdate(
+    current,
+    '美团',
+    '美团优惠',
+    true,
+    () => true,
+  );
+
+  assert.equal(declined.cancelled, true);
+  assert.equal(declined.config.rulesText, '广告');
+  assert.equal(declined.config.filterVideoDynamics, false);
+  assert.equal(accepted.cancelled, false);
+  assert.equal(accepted.config.rulesText, '广告\n美团');
+  assert.equal(accepted.config.filterVideoDynamics, true);
 });
 
 test('merges local config edits with newer values from another tab', () => {
@@ -448,6 +510,73 @@ test('does not verify configuration after Tampermonkey rejects the write', async
     /storage unavailable/,
   );
   assert.equal(readAttempted, false);
+});
+
+test('writes only when a serialized configuration update changes storage', async () => {
+  const { updateStoredConfig } = loadTestApi();
+  const storage = new Map([
+    ['config-key', {
+      enabled: true,
+      rulesText: '广告',
+      showStatusPanel: true,
+      filterVideoDynamics: true,
+      showQuickBlockButton: true,
+    }],
+  ]);
+  let writeCount = 0;
+  const setValue = async (key, value) => {
+    writeCount += 1;
+    storage.set(key, value);
+  };
+  const getValue = async (key, fallback) => storage.get(key) ?? fallback;
+
+  await updateStoredConfig('config-key', {}, (current) => current, setValue, getValue);
+  assert.equal(writeCount, 0);
+
+  await updateStoredConfig(
+    'config-key',
+    {},
+    (current) => ({ ...current, rulesText: `${current.rulesText}\n美团` }),
+    setValue,
+    getValue,
+  );
+  assert.equal(writeCount, 1);
+  assert.equal(storage.get('config-key').rulesText, '广告\n美团');
+});
+
+test('cancelled video quick-block does not write configuration storage', async () => {
+  const { resolveQuickBlockUpdate, updateStoredConfig } = loadTestApi();
+  const storage = new Map([
+    ['config-key', {
+      enabled: true,
+      rulesText: '广告',
+      showStatusPanel: true,
+      filterVideoDynamics: false,
+      showQuickBlockButton: true,
+    }],
+  ]);
+  let writeCount = 0;
+
+  await updateStoredConfig(
+    'config-key',
+    {},
+    (current) => resolveQuickBlockUpdate(
+      current,
+      '美团',
+      '美团优惠',
+      true,
+      () => false,
+    ).config,
+    async (key, value) => {
+      writeCount += 1;
+      storage.set(key, value);
+    },
+    async (key, fallback) => storage.get(key) ?? fallback,
+  );
+
+  assert.equal(writeCount, 0);
+  assert.equal(storage.get('config-key').rulesText, '广告');
+  assert.equal(storage.get('config-key').filterVideoDynamics, false);
 });
 
 test('serializes state patches and merges each patch into the latest saved state', async () => {
