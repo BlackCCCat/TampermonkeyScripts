@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.5.4
+// @version      0.5.5
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -340,15 +340,70 @@
     return -1;
   }
 
+  function splitRuleEntries(rulesText) {
+    const entries = [];
+    let entry = '';
+    let entryStarted = false;
+    let inRegex = false;
+    let inCharacterClass = false;
+    let escaped = false;
+
+    const pushEntry = () => {
+      const pendingEntries = inRegex ? entry.split(/[,，]/) : [entry];
+      pendingEntries.forEach((pendingEntry) => {
+        if (pendingEntry.trim()) entries.push(pendingEntry.trim());
+      });
+      entry = '';
+      entryStarted = false;
+      inRegex = false;
+      inCharacterClass = false;
+      escaped = false;
+    };
+
+    for (const character of String(rulesText ?? '')) {
+      if (character === '\r' || character === '\n') {
+        pushEntry();
+        continue;
+      }
+      if (!inRegex && (character === ',' || character === '，')) {
+        pushEntry();
+        continue;
+      }
+
+      entry += character;
+      if (!entryStarted && !/\s/.test(character)) {
+        entryStarted = true;
+        inRegex = character === '/';
+        continue;
+      }
+      if (!inRegex) continue;
+      if (escaped) {
+        escaped = false;
+      } else if (character === '\\') {
+        escaped = true;
+      } else if (character === '[') {
+        inCharacterClass = true;
+      } else if (character === ']') {
+        inCharacterClass = false;
+      } else if (character === '/' && !inCharacterClass) {
+        inRegex = false;
+      }
+    }
+    pushEntry();
+    return entries;
+  }
+
+  function formatRulesText(rulesText) {
+    return splitRuleEntries(rulesText).join(', ');
+  }
+
   function parseRules(rulesText) {
     const rules = [];
     const errors = [];
 
-    String(rulesText ?? '')
-      .split(/\r?\n/)
-      .forEach((rawLine, index) => {
-        const line = rawLine.trim();
-        if (!line || line.startsWith('#')) return;
+    splitRuleEntries(rulesText)
+      .forEach((line, index) => {
+        if (line.startsWith('#')) return;
 
         const closingSlash = line.startsWith('/') ? findRegexClosingSlash(line) : -1;
         if (closingSlash > 0) {
@@ -362,7 +417,7 @@
               matcher: new RegExp(source, flags),
             });
           } catch (error) {
-            errors.push(`第 ${index + 1} 行：${error.message}`);
+            errors.push(`第 ${index + 1} 项：${error.message}`);
           }
           return;
         }
@@ -380,7 +435,7 @@
 
   function appendQuickBlockKeyword(rulesText, input, cardText) {
     const keyword = normalizeText(input);
-    const currentRulesText = String(rulesText ?? '').trimEnd();
+    const currentRulesText = formatRulesText(rulesText);
     if (!keyword) {
       return { rulesText: currentRulesText, keyword, added: false, error: '关键词不能为空' };
     }
@@ -411,7 +466,7 @@
     return {
       rulesText: exists
         ? currentRulesText
-        : [currentRulesText, keyword].filter(Boolean).join('\n'),
+        : [currentRulesText, keyword].filter(Boolean).join(', '),
       keyword,
       added: !exists,
       error: '',
@@ -609,6 +664,7 @@
       extractCardText,
       findMatch,
       findMatchRanges,
+      formatRulesText,
       formatStatusText,
       highlightPiecesEqual,
       isVideoDynamic,
@@ -1304,9 +1360,9 @@
           <input id="bdf-show-quick-block" type="checkbox">
           在每条动态右上角显示“屏蔽”按钮
         </label>
-        <label for="bdf-rules">屏蔽规则（每行一条）</label>
-        <textarea id="bdf-rules" spellcheck="false" placeholder="广告\n/抽奖|推广/i"></textarea>
-        <p class="bdf-help">普通文本按关键字匹配（不区分大小写）；以 <code>/表达式/标志</code> 书写正则；正则含正向前瞻时，查看模式优先标红其中实际命中的词；以 <code>#</code> 开头的行是注释。</p>
+        <label for="bdf-rules">屏蔽规则（使用逗号分隔）</label>
+        <textarea id="bdf-rules" spellcheck="false" placeholder="广告, 带货, /抽奖|推广/i"></textarea>
+        <p class="bdf-help">支持英文或中文逗号分隔；普通文本按关键字匹配（不区分大小写）；以 <code>/表达式/标志</code> 书写正则，正则内部的逗号不会被拆分；正则含正向前瞻时，查看模式优先标红其中实际命中的词；以 <code>#</code> 开头的项是注释。</p>
         <pre id="bdf-validation" aria-live="polite"></pre>
         <div class="bdf-actions">
           <button type="button" data-action="cancel">取消</button>
@@ -1337,7 +1393,7 @@
     showStatusInput.checked = config.showStatusPanel;
     filterVideoInput.checked = config.filterVideoDynamics;
     showQuickBlockInput.checked = config.showQuickBlockButton;
-    rulesInput.value = config.rulesText;
+    rulesInput.value = formatRulesText(config.rulesText);
 
     const validate = () => {
       const result = parseRules(rulesInput.value);
@@ -1372,7 +1428,7 @@
       try {
         const editedConfig = {
           enabled: enabledInput.checked,
-          rulesText: rulesInput.value,
+          rulesText: formatRulesText(rulesInput.value),
           showStatusPanel: showStatusInput.checked,
           filterVideoDynamics: filterVideoInput.checked,
           showQuickBlockButton: showQuickBlockInput.checked,

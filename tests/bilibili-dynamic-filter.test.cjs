@@ -49,6 +49,27 @@ test('parses keywords, comments, and regular expressions', () => {
   assert.equal(result.errors.length, 0);
 });
 
+test('parses comma-separated rules without splitting commas inside regex', () => {
+  const { formatRulesText, parseRules } = loadTestApi();
+  const source = '广告，美团, /\\d{1,3}元|淘宝/i, # 暂停使用';
+  const result = parseRules(source);
+
+  assert.deepEqual(
+    Array.from(result.rules, ({ type, source: ruleSource, flags }) => ({
+      type,
+      source: ruleSource,
+      flags,
+    })),
+    [
+      { type: 'keyword', source: '广告', flags: '' },
+      { type: 'keyword', source: '美团', flags: '' },
+      { type: 'regex', source: '\\d{1,3}元|淘宝', flags: 'i' },
+    ],
+  );
+  assert.equal(result.errors.length, 0);
+  assert.equal(formatRulesText('广告\n美团, /\\d{1,3}元/i'), '广告, 美团, /\\d{1,3}元/i');
+});
+
 test('reports invalid regular expressions without discarding valid rules', () => {
   const { parseRules } = loadTestApi();
   const result = parseRules('正常关键字\n/(/');
@@ -56,7 +77,21 @@ test('reports invalid regular expressions without discarding valid rules', () =>
   assert.equal(result.rules.length, 1);
   assert.equal(result.rules[0].source, '正常关键字');
   assert.equal(result.errors.length, 1);
-  assert.match(result.errors[0], /第 2 行/);
+  assert.match(result.errors[0], /第 2 项/);
+});
+
+test('does not let an unterminated slash swallow following legacy rules', () => {
+  const { parseRules } = loadTestApi();
+  const result = parseRules('/unfinished, 美团\n广告');
+
+  assert.deepEqual(
+    Array.from(result.rules, ({ type, source }) => ({ type, source })),
+    [
+      { type: 'keyword', source: '/unfinished' },
+      { type: 'keyword', source: '美团' },
+      { type: 'keyword', source: '广告' },
+    ],
+  );
 });
 
 test('matches keywords case-insensitively and returns the matched rule', () => {
@@ -200,11 +235,11 @@ test('appends a matching quick-block keyword once', () => {
 
   assert.deepEqual(
     { ...appendQuickBlockKeyword('广告', ' 美团 ', '今天美团有优惠') },
-    { rulesText: '广告\n美团', keyword: '美团', added: true, error: '' },
+    { rulesText: '广告, 美团', keyword: '美团', added: true, error: '' },
   );
   assert.deepEqual(
-    { ...appendQuickBlockKeyword('广告\n美团', '美团', '今天美团有优惠') },
-    { rulesText: '广告\n美团', keyword: '美团', added: false, error: '' },
+    { ...appendQuickBlockKeyword('广告, 美团', '美团', '今天美团有优惠') },
+    { rulesText: '广告, 美团', keyword: '美团', added: false, error: '' },
   );
 });
 
@@ -245,7 +280,7 @@ test('requires confirmation before quick-block enables video filtering', () => {
   assert.equal(declined.config.rulesText, '广告');
   assert.equal(declined.config.filterVideoDynamics, false);
   assert.equal(accepted.cancelled, false);
-  assert.equal(accepted.config.rulesText, '广告\n美团');
+  assert.equal(accepted.config.rulesText, '广告, 美团');
   assert.equal(accepted.config.filterVideoDynamics, true);
 });
 
