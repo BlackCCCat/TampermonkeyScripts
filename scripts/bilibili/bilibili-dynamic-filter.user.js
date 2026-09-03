@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.5.5
+// @version      0.6.0
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -340,61 +340,148 @@
     return -1;
   }
 
-  function splitRuleEntries(rulesText) {
+  function splitIntoLines(rulesText) {
+    const lines = [];
+    for (const line of String(rulesText ?? '').split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed) lines.push(trimmed);
+    }
+    return lines;
+  }
+
+  function startsComment(line) {
+    const leadingIndex = line.search(/[^#\s]/);
+    return leadingIndex !== -1 && line[leadingIndex] === '#';
+  }
+
+  // 若一条“整行”文本含逗号分隔，用逐字符状态机扫描整行，在保证
+  // “正则内部的逗号不拆分、字符类不误判、转义不误伤”的前提下切分条目。
+  // 支持关键词与正则任意混排（旧版逗号格式），也兼容正则独占一行的新格式输入。
+  function splitLegacyCommaLine(line) {
     const entries = [];
     let entry = '';
-    let entryStarted = false;
     let inRegex = false;
     let inCharacterClass = false;
     let escaped = false;
 
-    const pushEntry = () => {
-      const pendingEntries = inRegex ? entry.split(/[,，]/) : [entry];
-      pendingEntries.forEach((pendingEntry) => {
-        if (pendingEntry.trim()) entries.push(pendingEntry.trim());
-      });
-      entry = '';
-      entryStarted = false;
-      inRegex = false;
-      inCharacterClass = false;
-      escaped = false;
+    const pushToken = (token) => {
+      if (token.trim()) entries.push(token.trim());
     };
 
-    for (const character of String(rulesText ?? '')) {
-      if (character === '\r' || character === '\n') {
-        pushEntry();
-        continue;
-      }
-      if (!inRegex && (character === ',' || character === '，')) {
-        pushEntry();
+    for (let index = 0; index < line.length; index += 1) {
+      const character = line[index];
+
+      if (inRegex) {
+        entry += character;
+        if (escaped) {
+          escaped = false;
+        } else if (character === '\\') {
+          escaped = true;
+        } else if (character === '[') {
+          inCharacterClass = true;
+        } else if (character === ']') {
+          inCharacterClass = false;
+        } else if (character === '/' && !inCharacterClass) {
+          inRegex = false;
+        }
         continue;
       }
 
-      entry += character;
-      if (!entryStarted && !/\s/.test(character)) {
-        entryStarted = true;
-        inRegex = character === '/';
+      if (character === ',' || character === '，') {
+        pushToken(entry);
+        entry = '';
         continue;
       }
-      if (!inRegex) continue;
-      if (escaped) {
-        escaped = false;
-      } else if (character === '\\') {
-        escaped = true;
-      } else if (character === '[') {
-        inCharacterClass = true;
-      } else if (character === ']') {
-        inCharacterClass = false;
-      } else if (character === '/' && !inCharacterClass) {
-        inRegex = false;
+
+      const isLeading = entry.trim() === '' && !/\s/.test(character);
+      if (!inRegex && isLeading && character === '/') {
+        const closing = findRegexClosingSlash(line.slice(index));
+        if (closing > 0) {
+          entry += character;
+          inRegex = true;
+          continue;
+        }
       }
+      entry += character;
     }
-    pushEntry();
+    pushToken(entry);
     return entries;
   }
 
+  // 将规则文本拆成条目列表（一条条目 = 一个正则 / 注释 / 单个关键词）。
+  // 规则按行书写：每个正则表达式独占一行；关键词单独成行，行内用逗号分隔。
+  // 旧版“单行逗号混排”的写法仍能正确解析（正则内部逗号不会拆分）。
+  function splitRuleEntries(rulesText) {
+    const entries = [];
+    let pendingRegex = '';
+
+    const flushPendingRegex = () => {
+      if (pendingRegex) {
+        entries.push(pendingRegex.trim());
+        pendingRegex = '';
+      }
+    };
+
+    splitIntoLines(rulesText).forEach((line) => {
+      if (line.startsWith('/')) {
+        if (findRegexClosingSlash(line) > 0) {
+          // 完整的正则独占一行，是首要的新格式。
+          flushPendingRegex();
+          entries.push(line);
+          return;
+        }
+        if (/[,\uFF0C]/.test(line)) {
+          // 以 / 开头但未闭合，且含逗号：实际是旧版逗号混排（未闭合正则混在关键词行里），
+          // 按逐字符扫描拆开，避免把整行当作一个正则吞掉后续规则。
+          flushPendingRegex();
+          splitLegacyCommaLine(line).forEach((entry) => entries.push(entry));
+          return;
+        }
+        // 无逗号的未闭合正则（例如 /(/）：单独记录，交给 parseRules 报非法正则错误。
+        flushPendingRegex();
+        pendingRegex = line;
+        return;
+      }
+
+      flushPendingRegex();
+      if (startsComment(line) || !/[,\uFF0C]/.test(line)) {
+        entries.push(line);
+        return;
+      }
+      splitLegacyCommaLine(line).forEach((entry) => entries.push(entry));
+    });
+    flushPendingRegex();
+    return entries;
+  }
+
+  function groupRuleEntries(rulesText) {
+    const grouped = { keywords: [], comments: [], regexes: [], errors: [] };
+    splitRuleEntries(rulesText).forEach((entry) => {
+      if (entry.startsWith('#')) {
+        grouped.comments.push(entry);
+      } else if (entry.startsWith('/')) {
+        grouped.regexes.push(entry);
+      } else {
+        grouped.keywords.push(entry);
+      }
+    });
+    return grouped;
+  }
+
+  // 将规则文本整理成新格式：正则每个占一行、关键词合并成一行且用逗号分隔。
   function formatRulesText(rulesText) {
-    return splitRuleEntries(rulesText).join(', ');
+    if (rulesText && typeof rulesText === 'object' && !Array.isArray(rulesText)) {
+      return formatGroupedRules(rulesText);
+    }
+    return formatGroupedRules(groupRuleEntries(rulesText));
+  }
+
+  function formatGroupedRules(grouped) {
+    const sections = [];
+    if (grouped.comments.length > 0) sections.push(grouped.comments.join('\n'));
+    if (grouped.keywords.length > 0) sections.push(grouped.keywords.join(', '));
+    if (grouped.regexes.length > 0) sections.push(grouped.regexes.join('\n'));
+    return sections.join('\n');
   }
 
   function parseRules(rulesText) {
@@ -417,7 +504,7 @@
               matcher: new RegExp(source, flags),
             });
           } catch (error) {
-            errors.push(`第 ${index + 1} 项：${error.message}`);
+            errors.push(`第 ${index + 1} 行：${error.message}`);
           }
           return;
         }
@@ -435,16 +522,16 @@
 
   function appendQuickBlockKeyword(rulesText, input, cardText) {
     const keyword = normalizeText(input);
-    const currentRulesText = formatRulesText(rulesText);
+    const grouped = groupRuleEntries(rulesText);
     if (!keyword) {
-      return { rulesText: currentRulesText, keyword, added: false, error: '关键词不能为空' };
+      return { rulesText: formatRulesText(grouped), keyword, added: false, error: '关键词不能为空' };
     }
     if (keyword.length > 80) {
-      return { rulesText: currentRulesText, keyword, added: false, error: '关键词不能超过 80 个字符' };
+      return { rulesText: formatRulesText(grouped), keyword, added: false, error: '关键词不能超过 80 个字符' };
     }
     if (keyword.startsWith('#') || keyword.startsWith('/')) {
       return {
-        rulesText: currentRulesText,
+        rulesText: formatRulesText(grouped),
         keyword,
         added: false,
         error: '快捷屏蔽只支持普通关键词，且不能以 # 或 / 开头',
@@ -452,21 +539,22 @@
     }
     if (!normalizeText(cardText).toLocaleLowerCase().includes(keyword.toLocaleLowerCase())) {
       return {
-        rulesText: currentRulesText,
+        rulesText: formatRulesText(grouped),
         keyword,
         added: false,
         error: '当前动态不包含这个关键词，请重新选择',
       };
     }
 
-    const exists = parseRules(currentRulesText).rules.some((rule) => (
+    const exists = parseRules(formatRulesText(grouped)).rules.some((rule) => (
       rule.type === 'keyword' &&
       rule.keyword === keyword.toLocaleLowerCase()
     ));
+    const nextKeywords = exists
+      ? grouped.keywords
+      : [...grouped.keywords, keyword];
     return {
-      rulesText: exists
-        ? currentRulesText
-        : [currentRulesText, keyword].filter(Boolean).join(', '),
+      rulesText: formatRulesText({ ...grouped, keywords: nextKeywords }),
       keyword,
       added: !exists,
       error: '',
@@ -666,6 +754,7 @@
       findMatchRanges,
       formatRulesText,
       formatStatusText,
+      groupRuleEntries,
       highlightPiecesEqual,
       isVideoDynamic,
       isDragGesture,
@@ -1360,9 +1449,9 @@
           <input id="bdf-show-quick-block" type="checkbox">
           在每条动态右上角显示“屏蔽”按钮
         </label>
-        <label for="bdf-rules">屏蔽规则（使用逗号分隔）</label>
-        <textarea id="bdf-rules" spellcheck="false" placeholder="广告, 带货, /抽奖|推广/i"></textarea>
-        <p class="bdf-help">支持英文或中文逗号分隔；普通文本按关键字匹配（不区分大小写）；以 <code>/表达式/标志</code> 书写正则，正则内部的逗号不会被拆分；正则含正向前瞻时，查看模式优先标红其中实际命中的词；以 <code>#</code> 开头的项是注释。</p>
+        <label for="bdf-rules">屏蔽规则（关键词用逗号分隔，每条正则独占一行）</label>
+        <textarea id="bdf-rules" spellcheck="false" placeholder="广告, 带货&#10;/抽奖|推广/i"></textarea>
+        <p class="bdf-help">关键词单独占一行、彼此用英文或中文逗号分隔，按包含关系匹配（不区分大小写）；每个正则表达式单独占一行，以 <code>/表达式/标志</code> 书写，正则内部的逗号不会被拆分；正则含正向前瞻时，查看模式优先标红其中实际命中的词；以 <code>#</code> 开头的行是注释。</p>
         <pre id="bdf-validation" aria-live="polite"></pre>
         <div class="bdf-actions">
           <button type="button" data-action="cancel">取消</button>

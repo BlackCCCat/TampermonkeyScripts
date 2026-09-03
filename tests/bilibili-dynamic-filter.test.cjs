@@ -33,11 +33,7 @@ function readScriptMetadata(source) {
 
 test('parses keywords, comments, and regular expressions', () => {
   const { parseRules } = loadTestApi();
-  const result = parseRules(`
-    广告
-    # 这是一行注释
-    /抽奖|推广/i
-  `);
+  const result = parseRules(`广告\n# 这是一行注释\n/抽奖|推广/i`);
 
   assert.deepEqual(
     Array.from(result.rules, ({ type, source, flags }) => ({ type, source, flags })),
@@ -49,10 +45,9 @@ test('parses keywords, comments, and regular expressions', () => {
   assert.equal(result.errors.length, 0);
 });
 
-test('parses comma-separated rules without splitting commas inside regex', () => {
+test('parses comma-separated keywords and one-regex-per-line rules', () => {
   const { formatRulesText, parseRules } = loadTestApi();
-  const source = '广告，美团, /\\d{1,3}元|淘宝/i, # 暂停使用';
-  const result = parseRules(source);
+  const result = parseRules('广告，美团, 带货\n/\\d{1,3}元|淘宝/i\n# 暂停使用');
 
   assert.deepEqual(
     Array.from(result.rules, ({ type, source: ruleSource, flags }) => ({
@@ -63,11 +58,78 @@ test('parses comma-separated rules without splitting commas inside regex', () =>
     [
       { type: 'keyword', source: '广告', flags: '' },
       { type: 'keyword', source: '美团', flags: '' },
+      { type: 'keyword', source: '带货', flags: '' },
       { type: 'regex', source: '\\d{1,3}元|淘宝', flags: 'i' },
     ],
   );
   assert.equal(result.errors.length, 0);
-  assert.equal(formatRulesText('广告\n美团, /\\d{1,3}元/i'), '广告, 美团, /\\d{1,3}元/i');
+});
+
+test('does not split commas inside a regex that spans its own line', () => {
+  const { parseRules } = loadTestApi();
+  const result = parseRules('美团\n/\\d{1,3}元|淘宝/i');
+
+  assert.deepEqual(
+    Array.from(result.rules, ({ type, source }) => ({ type, source })),
+    [
+      { type: 'keyword', source: '美团' },
+      { type: 'regex', source: '\\d{1,3}元|淘宝' },
+    ],
+  );
+  assert.equal(result.errors.length, 0);
+});
+
+test('formats rules with keywords on one line and each regex on its own line', () => {
+  const { formatRulesText } = loadTestApi();
+
+  assert.equal(
+    formatRulesText('广告\n美团, /\\d{1,3}元/i'),
+    '广告, 美团\n/\\d{1,3}元/i',
+  );
+  assert.equal(
+    formatRulesText('# 注释\n推广\n/抽奖|推广/i'),
+    '# 注释\n推广\n/抽奖|推广/i',
+  );
+  assert.equal(
+    formatRulesText('/抽奖/i\n广告, 带货'),
+    '广告, 带货\n/抽奖/i',
+  );
+  assert.equal(formatRulesText('广告，美团，/推广/i'), '广告, 美团\n/推广/i');
+});
+
+test('groups formatted rules into comments, keywords, and regexes', () => {
+  const { groupRuleEntries } = loadTestApi();
+
+  const newFormat = groupRuleEntries('# 注释\n广告, 带货\n/抽奖/i\n/推广/i\n/\\d{1,3}元/i');
+  assert.deepEqual(
+    {
+      keywords: Array.from(newFormat.keywords),
+      comments: Array.from(newFormat.comments),
+      regexes: Array.from(newFormat.regexes),
+      errors: Array.from(newFormat.errors),
+    },
+    {
+      keywords: ['广告', '带货'],
+      comments: ['# 注释'],
+      regexes: ['/抽奖/i', '/推广/i', '/\\d{1,3}元/i'],
+      errors: [],
+    },
+  );
+  const legacyFormat = groupRuleEntries('广告, 美团, /\\d{1,3}元/i');
+  assert.deepEqual(
+    {
+      keywords: Array.from(legacyFormat.keywords),
+      comments: Array.from(legacyFormat.comments),
+      regexes: Array.from(legacyFormat.regexes),
+      errors: Array.from(legacyFormat.errors),
+    },
+    {
+      keywords: ['广告', '美团'],
+      comments: [],
+      regexes: ['/\\d{1,3}元/i'],
+      errors: [],
+    },
+  );
 });
 
 test('reports invalid regular expressions without discarding valid rules', () => {
@@ -77,7 +139,7 @@ test('reports invalid regular expressions without discarding valid rules', () =>
   assert.equal(result.rules.length, 1);
   assert.equal(result.rules[0].source, '正常关键字');
   assert.equal(result.errors.length, 1);
-  assert.match(result.errors[0], /第 2 项/);
+  assert.match(result.errors[0], /第 2 行/);
 });
 
 test('does not let an unterminated slash swallow following legacy rules', () => {
@@ -240,6 +302,33 @@ test('appends a matching quick-block keyword once', () => {
   assert.deepEqual(
     { ...appendQuickBlockKeyword('广告, 美团', '美团', '今天美团有优惠') },
     { rulesText: '广告, 美团', keyword: '美团', added: false, error: '' },
+  );
+});
+
+test('appends quick-block keywords to the keyword line, not after regexes', () => {
+  const { appendQuickBlockKeyword } = loadTestApi();
+
+  assert.deepEqual(
+    { ...appendQuickBlockKeyword('广告\n/抽奖|推广/i', '美团', '今天美团有优惠') },
+    {
+      rulesText: '广告, 美团\n/抽奖|推广/i',
+      keyword: '美团',
+      added: true,
+      error: '',
+    },
+  );
+  assert.deepEqual(
+    { ...appendQuickBlockKeyword('广告, 美团\n/抽奖|推广/i', '美团', '今天美团有优惠') },
+    {
+      rulesText: '广告, 美团\n/抽奖|推广/i',
+      keyword: '美团',
+      added: false,
+      error: '',
+    },
+  );
+  assert.deepEqual(
+    { ...appendQuickBlockKeyword('广告, 美团', '推广', '推广内容') },
+    { rulesText: '广告, 美团, 推广', keyword: '推广', added: true, error: '' },
   );
 });
 
