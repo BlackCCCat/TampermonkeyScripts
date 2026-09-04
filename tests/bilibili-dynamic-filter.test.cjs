@@ -22,6 +22,16 @@ function loadTestApi() {
   return sandbox.__BDF_TEST_EXPORTS__;
 }
 
+function readUserScriptSource() {
+  return fs.readFileSync(path.join(
+    __dirname,
+    '..',
+    'scripts',
+    'bilibili',
+    'bilibili-dynamic-filter.user.js',
+  ), 'utf8');
+}
+
 function readScriptMetadata(source) {
   return Object.fromEntries(
     Array.from(source.matchAll(/^\/\/\s+@(\S+)\s+(.+)$/gm), ([, key, value]) => [
@@ -371,6 +381,20 @@ test('requires confirmation before quick-block enables video filtering', () => {
   assert.equal(accepted.cancelled, false);
   assert.equal(accepted.config.rulesText, '广告, 美团');
   assert.equal(accepted.config.filterVideoDynamics, true);
+});
+
+test('uses a system-theme-aware custom dialog for quick blocking', () => {
+  const source = readUserScriptSource();
+  const quickBlockStart = source.indexOf('function quickBlockCard');
+  const quickBlockEnd = source.indexOf('\n  function syncQuickBlockButton', quickBlockStart);
+  const quickBlockSource = source.slice(quickBlockStart, quickBlockEnd);
+
+  assert.doesNotMatch(quickBlockSource, /window\.(?:prompt|confirm|alert)/);
+  assert.match(source, /#bdf-quick-block-dialog/);
+  assert.match(
+    source,
+    /@media \(prefers-color-scheme: dark\)[\s\S]*#bdf-quick-block-dialog/,
+  );
 });
 
 test('merges local config edits with newer values from another tab', () => {

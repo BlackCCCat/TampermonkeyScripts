@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.6.0
+// @version      0.6.1
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -790,7 +790,7 @@
   const HIGHLIGHT_SELECTOR = '[data-bdf-match-highlight]';
   const QUICK_BLOCK_SELECTOR = '[data-bdf-quick-block]';
   const QUICK_BLOCK_HOST_CLASS = 'bdf-quick-block-host';
-  const OWNED_UI_SELECTOR = `#bdf-status, #bdf-overlay, ${QUICK_BLOCK_SELECTOR}`;
+  const OWNED_UI_SELECTOR = `#bdf-status, #bdf-overlay, #bdf-quick-block-overlay, ${QUICK_BLOCK_SELECTOR}`;
 
   let config = normalizeConfig(DEFAULT_CONFIG);
   let uiState = normalizeUiState(DEFAULT_UI_STATE);
@@ -809,6 +809,7 @@
   let compactSavePending = false;
   let suppressCompactClick = false;
   let closeConfigDialog = null;
+  let closeQuickBlockDialog = null;
   const pendingRoots = new Set();
   const cardState = new WeakMap();
 
@@ -974,38 +975,109 @@
     return normalizeText(selection.toString()).slice(0, 80);
   }
 
-  async function quickBlockCard(card) {
-    const input = window.prompt(
-      '输入要加入屏蔽列表的关键词（可以先选中动态里的文字再点击“屏蔽”）',
-      selectedTextInsideCard(card),
-    );
-    if (input === null) return;
-
+  function quickBlockCard(card) {
+    if (closeQuickBlockDialog && closeQuickBlockDialog() === false) return;
     const cardText = extractCardText(card);
     const videoDynamic = isVideoDynamic(card);
+    const previousFocus = document.activeElement;
+    const overlay = document.createElement('div');
+    overlay.id = 'bdf-quick-block-overlay';
+    overlay.innerHTML = `
+      <form id="bdf-quick-block-dialog" role="dialog" aria-modal="true" aria-labelledby="bdf-quick-block-title">
+        <h2 id="bdf-quick-block-title">添加屏蔽关键词</h2>
+        <p class="bdf-help">可以先选中动态中的文字，再点击右上角“屏蔽”。</p>
+        <label for="bdf-quick-block-input">关键词</label>
+        <input id="bdf-quick-block-input" type="text" maxlength="80" autocomplete="off" aria-describedby="bdf-quick-block-validation">
+        <p class="bdf-help" id="bdf-quick-block-video-note">这是一条视频动态；如果视频过滤当前已关闭，保存时会同时开启。</p>
+        <pre id="bdf-quick-block-validation" aria-live="polite"></pre>
+        <div class="bdf-actions">
+          <button type="button" data-action="cancel">取消</button>
+          <button type="submit" class="bdf-primary" data-action="save">保存并屏蔽</button>
+        </div>
+      </form>
+    `;
 
-    let outcome;
-    try {
-      await saveConfig((currentConfig) => {
-        outcome = resolveQuickBlockUpdate(
-          currentConfig,
-          input,
-          cardText,
-          videoDynamic,
-          () => window.confirm(
-            '当前已关闭视频动态过滤。是否同时开启，并屏蔽这条视频动态？',
-          ),
-        );
-        if (outcome.result.error) throw new Error(outcome.result.error);
-        return outcome.config;
-      });
-      if (outcome.cancelled) return;
-      if (!outcome.result.added) {
-        window.alert(`“${outcome.result.keyword}”已经在屏蔽列表中`);
+    const form = overlay.querySelector('#bdf-quick-block-dialog');
+    const input = overlay.querySelector('#bdf-quick-block-input');
+    const videoNote = overlay.querySelector('#bdf-quick-block-video-note');
+    const validation = overlay.querySelector('#bdf-quick-block-validation');
+    const cancelButton = overlay.querySelector('[data-action="cancel"]');
+    const saveButton = overlay.querySelector('[data-action="save"]');
+    let isSaving = false;
+    input.value = selectedTextInsideCard(card);
+    videoNote.hidden = !videoDynamic;
+
+    const setSaving = (saving) => {
+      isSaving = saving;
+      input.disabled = saving;
+      cancelButton.disabled = saving;
+      saveButton.disabled = saving;
+      saveButton.textContent = saving ? '正在保存…' : '保存并屏蔽';
+    };
+    const close = (force = false) => {
+      if (isSaving && !force) return false;
+      document.removeEventListener('keydown', handleKeydown);
+      overlay.remove();
+      if (closeQuickBlockDialog === close) closeQuickBlockDialog = null;
+      previousFocus?.focus?.();
+      return true;
+    };
+    const handleKeydown = (event) => {
+      if (event.key === 'Escape') close();
+    };
+
+    input.addEventListener('input', () => {
+      validation.textContent = '';
+      validation.classList.remove('bdf-error');
+    });
+    cancelButton.addEventListener('click', () => close());
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (isSaving) return;
+      setSaving(true);
+
+      let outcome;
+      try {
+        await saveConfig((currentConfig) => {
+          outcome = resolveQuickBlockUpdate(
+            currentConfig,
+            input.value,
+            cardText,
+            videoDynamic,
+            () => true,
+          );
+          if (outcome.result.error) throw new Error(outcome.result.error);
+          return outcome.config;
+        });
+      } catch (error) {
+        validation.textContent = error instanceof Error
+          ? error.message
+          : '快捷屏蔽保存失败，请重试';
+        validation.classList.add('bdf-error');
+        setSaving(false);
+        input.focus();
+        return;
       }
-    } catch (error) {
-      window.alert(error instanceof Error ? error.message : '快捷屏蔽保存失败，请重试');
-    }
+
+      if (!outcome.result.added) {
+        validation.textContent = `“${outcome.result.keyword}”已经在屏蔽列表中`;
+        validation.classList.remove('bdf-error');
+        isSaving = false;
+        cancelButton.disabled = false;
+        cancelButton.textContent = '关闭';
+        saveButton.hidden = true;
+        return;
+      }
+      close(true);
+    });
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) close();
+    });
+    closeQuickBlockDialog = close;
+    document.addEventListener('keydown', handleKeydown);
+    document.body.append(overlay);
+    input.focus();
+    if (input.value) input.select();
   }
 
   function syncQuickBlockButton(card) {
@@ -1028,7 +1100,7 @@
     button.addEventListener('click', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      void quickBlockCard(card);
+      quickBlockCard(card);
     });
     card.classList.add(QUICK_BLOCK_HOST_CLASS);
     card.append(button);
@@ -1653,32 +1725,36 @@
       .bdf-status-actions [data-action="preview-video"][aria-pressed="true"] {
         color: #fff; background: #00aeec;
       }
-      #bdf-overlay {
+      #bdf-overlay, #bdf-quick-block-overlay {
         position: fixed; inset: 0; z-index: 99999; display: grid; place-items: center;
         padding: 20px; background: rgb(0 0 0 / 45%); color: #18191c;
       }
-      #bdf-dialog {
+      #bdf-dialog, #bdf-quick-block-dialog {
+        color-scheme: light;
         width: min(560px, 100%); box-sizing: border-box; padding: 22px;
         border-radius: 14px; background: #fff; box-shadow: 0 16px 48px rgb(0 0 0 / 24%);
         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
-      #bdf-dialog h2 { margin: 0 0 16px; font-size: 20px; }
-      #bdf-dialog label { display: block; margin: 10px 0 6px; font-weight: 600; }
+      #bdf-quick-block-dialog { width: min(420px, 100%); }
+      #bdf-dialog h2, #bdf-quick-block-dialog h2 { margin: 0 0 16px; font-size: 20px; }
+      #bdf-dialog label, #bdf-quick-block-dialog label { display: block; margin: 10px 0 6px; font-weight: 600; }
       #bdf-dialog .bdf-switch-row { display: flex; gap: 8px; align-items: center; font-weight: 400; }
-      #bdf-rules {
+      #bdf-rules, #bdf-quick-block-input {
         display: block; width: 100%; min-height: 220px; box-sizing: border-box;
         resize: vertical; border: 1px solid #c9ccd0; border-radius: 8px; padding: 10px;
         color: inherit; background: #fff; font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
       }
-      #bdf-rules:focus { outline: 2px solid #00aeec44; border-color: #00aeec; }
+      #bdf-quick-block-input { min-height: 40px; resize: none; font-family: inherit; }
+      #bdf-rules:focus, #bdf-quick-block-input:focus { outline: 2px solid #00aeec44; border-color: #00aeec; }
       .bdf-help { margin: 8px 0; color: #61666d; font-size: 12px; }
-      #bdf-validation { min-height: 20px; margin: 8px 0; color: #2f9b61; white-space: pre-wrap; font: inherit; }
-      #bdf-validation.bdf-error { color: #d83a52; }
+      #bdf-validation, #bdf-quick-block-validation { min-height: 20px; margin: 8px 0; color: #2f9b61; white-space: pre-wrap; font: inherit; }
+      #bdf-validation.bdf-error, #bdf-quick-block-validation.bdf-error { color: #d83a52; }
       .bdf-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
       .bdf-actions button { border: 1px solid #c9ccd0; border-radius: 8px; padding: 7px 14px; background: #fff; cursor: pointer; }
       .bdf-actions .bdf-primary { border-color: #00aeec; color: #fff; background: #00aeec; }
       @media (prefers-color-scheme: dark) {
-        #bdf-status, #bdf-dialog, #bdf-rules { color: #e3e5e7; background: #242628; }
+        #bdf-status, #bdf-dialog, #bdf-rules, #bdf-quick-block-dialog, #bdf-quick-block-input { color: #e3e5e7; background: #242628; }
+        #bdf-dialog, #bdf-quick-block-dialog { color-scheme: dark; }
         #bdf-status { border-color: #55585c; }
         #bdf-status.bdf-compact { background: rgb(36 38 40 / 94%); }
         .bdf-collapse { color: #aeb3b8; background: #333538; }
@@ -1687,7 +1763,7 @@
         .bdf-status-actions button:hover { background: #163846; }
         .bdf-status-actions button:disabled { color: #777b80; background: #333538; }
         .bdf-status-actions [data-action="config"] { color: #fff; background: #00aeec; }
-        #bdf-rules, .bdf-actions button { border-color: #55585c; }
+        #bdf-rules, #bdf-quick-block-input, .bdf-actions button { border-color: #55585c; }
         .bdf-actions button { color: #e3e5e7; background: #333538; }
         .bdf-help { color: #aeb3b8; }
       }
