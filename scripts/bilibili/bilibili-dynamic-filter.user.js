@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.7.2
+// @version      0.7.3
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -45,7 +45,6 @@
     '.bili-dyn-card-video__desc',
   ];
   const CONTENT_SELECTOR = [
-    '.bili-rich-text__content',
     '.bili-dyn-content__orig__desc',
     '.bili-dyn-content__forw__desc',
     '.dyn-card-opus__title',
@@ -99,7 +98,7 @@
     const outermostNodes = contentNodes.filter((node) => (
       !contentNodes.some((candidate) => candidate !== node && candidate.contains?.(node))
     ));
-    return outermostNodes.length > 0 ? outermostNodes : [card];
+    return outermostNodes;
   }
 
   function buildCardTextIndex(card) {

@@ -860,6 +860,32 @@ test('extracts text from forwarded and opus dynamic content', () => {
   assert.equal(extractCardText(card), '转发内容中的推广关键字');
 });
 
+test('does not filter a video because its comment preview contains a keyword', () => {
+  const { extractCardText, findMatch, parseRules } = loadTestApi();
+  const nodes = [
+    { className: 'bili-dyn-card-video__title', innerText: '今天你的牛头烧了吗' },
+    { className: 'bili-rich-text__content', innerText: '评论说这是广告' },
+  ];
+  const card = {
+    querySelectorAll(selector) {
+      return nodes.filter((node) => selector.split(',').includes(`.${node.className}`));
+    },
+  };
+
+  const text = extractCardText(card);
+  assert.equal(text, '今天你的牛头烧了吗');
+  assert.equal(findMatch(text, parseRules('广告').rules), null);
+  nodes[0].innerText = '今天的视频有广告';
+  assert.equal(findMatch(extractCardText(card), parseRules('广告').rules)?.source, '广告');
+});
+
+test('does not treat an unknown card and its comments as dynamic content', () => {
+  const { extractCardText } = loadTestApi();
+  const card = { innerText: '评论里有广告', querySelectorAll: () => [] };
+
+  assert.equal(extractCardText(card), '');
+});
+
 test('does not duplicate text from nested content selectors', () => {
   const { extractCardText } = loadTestApi();
   const child = { innerText: '推广内容' };
