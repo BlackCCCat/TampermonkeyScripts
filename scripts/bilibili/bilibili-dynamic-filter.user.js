@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.7.1
+// @version      0.7.2
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -148,6 +148,19 @@
         .map((node) => node.innerText || node.textContent || '')
         .join(' '),
     );
+  }
+
+  function extractCardAuthor(card) {
+    const nameNode = card.querySelector(
+      '.bili-dyn-item__header .bili-dyn-title__text, .bili-dyn-item__header .bili-dyn-title__name',
+    );
+    const avatar = card.querySelector(
+      '.bili-dyn-item__avatar [data-layer-tag="AVATAR_LAYER"] img, .bili-dyn-item__avatar img',
+    );
+    return {
+      name: normalizeText(nameNode?.innerText || nameNode?.textContent) || '未知 UP 主',
+      avatarUrl: avatar?.currentSrc || avatar?.getAttribute('src') || avatar?.getAttribute('data-src') || '',
+    };
   }
 
   function normalizeConfig(stored) {
@@ -762,6 +775,7 @@
       clampPanelPosition,
       createSerializedUpdateQueue,
       extractCardText,
+      extractCardAuthor,
       findMatch,
       findMatchRanges,
       formatRulesText,
@@ -1413,16 +1427,25 @@
       if (!dialog.contains(event.target) && !statusPanel.contains(event.target)) close();
     };
 
-    cards.forEach((card, index) => {
+    cards.forEach((card) => {
       const item = document.createElement('li');
       const button = document.createElement('button');
-      const label = document.createElement('strong');
+      const author = document.createElement('span');
+      const avatar = document.createElement('img');
+      const name = document.createElement('strong');
       const excerpt = document.createElement('span');
       button.type = 'button';
-      label.textContent = `${card.classList.contains(VIDEO_MATCH_CLASS) ? '视频' : '动态'} ${index + 1}`;
+      author.className = 'bdf-list-author';
+      excerpt.className = 'bdf-list-excerpt';
+      const cardAuthor = extractCardAuthor(card);
+      avatar.alt = '';
+      avatar.loading = 'lazy';
+      if (cardAuthor.avatarUrl) avatar.src = cardAuthor.avatarUrl;
+      name.textContent = cardAuthor.name;
+      author.append(avatar, name);
       const text = extractCardText(card);
       excerpt.textContent = text ? `${text.slice(0, 120)}${text.length > 120 ? '…' : ''}` : '无文字内容';
-      button.append(label, excerpt);
+      button.append(author, excerpt);
       button.addEventListener('click', () => {
         if (!card.isConnected || !card.classList.contains(HIDDEN_CLASS)) {
           message.textContent = '这条动态已不在当前页面，请重新打开列表';
@@ -1923,8 +1946,10 @@
       #bdf-blocked-list button { display: block; width: 100%; border: 0; border-radius: 7px; padding: 10px; color: inherit; background: transparent; text-align: left; cursor: pointer; font: inherit; }
       #bdf-blocked-list button:hover, #bdf-blocked-list button:focus-visible { background: #f1f7fa; }
       #bdf-blocked-list button[aria-current="true"] { background: #e3f6fc; }
-      #bdf-blocked-list strong { display: block; margin-bottom: 3px; color: #fb7299; }
-      #bdf-blocked-list span { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; }
+      #bdf-blocked-list .bdf-list-author { display: flex; align-items: center; gap: 8px; margin-bottom: 5px; }
+      #bdf-blocked-list .bdf-list-author img { flex: 0 0 30px; width: 30px; height: 30px; border-radius: 50%; object-fit: cover; background: #f1f2f3; }
+      #bdf-blocked-list .bdf-list-author strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #bdf-blocked-list .bdf-list-excerpt { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; }
       #bdf-list-message { margin: 8px 0 0; color: #d83a52; }
       #bdf-list-message:empty { display: none; }
       #bdf-dialog h2, #bdf-quick-block-dialog h2 { margin: 0 0 16px; font-size: 20px; }

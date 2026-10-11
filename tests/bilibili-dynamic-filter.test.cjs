@@ -495,6 +495,33 @@ test('blocked-content list follows page order and limits the video view to hidde
   assert.deepEqual(Array.from(getBlockedPreviewCards(root, 'video')), cards.slice(1));
 });
 
+test('reads the dynamic author name and avatar for blocked-list entries', () => {
+  const { extractCardAuthor } = loadTestApi();
+  const card = {
+    querySelector(selector) {
+      if (selector.startsWith('.bili-dyn-item__header')) {
+        return { innerText: ' 哔哩哔哩番剧\n ' };
+      }
+      if (selector.startsWith('.bili-dyn-item__avatar')) {
+        return {
+          currentSrc: '',
+          getAttribute: (attribute) => attribute === 'src' ? '//i1.hdslb.com/bfs/face/avatar.webp' : null,
+        };
+      }
+      return null;
+    },
+  };
+
+  assert.deepEqual({ ...extractCardAuthor(card) }, {
+    name: '哔哩哔哩番剧',
+    avatarUrl: '//i1.hdslb.com/bfs/face/avatar.webp',
+  });
+  assert.deepEqual({ ...extractCardAuthor({ querySelector: () => null }) }, {
+    name: '未知 UP 主',
+    avatarUrl: '',
+  });
+});
+
 test('a single restored block stays hidden in preview until selected again', () => {
   const { isCardVisibleInPreview } = loadTestApi();
   const classes = new Set(['bdf-hidden-dynamic', 'bdf-matched-video-dynamic']);
