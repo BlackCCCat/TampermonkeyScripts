@@ -478,13 +478,21 @@ test('keeps only preview modes that still have matching hidden cards', () => {
   assert.equal(resolvePreviewMode('unexpected', 3, 1), 'none');
 });
 
-test('clicking the active preview mode restores filtering', () => {
-  const { togglePreviewMode } = loadTestApi();
+test('blocked-content list follows page order and limits the video view to hidden videos', () => {
+  const { getBlockedPreviewCards } = loadTestApi();
+  const makeCard = (video) => ({
+    classList: { contains: (name) => name === 'bdf-matched-video-dynamic' && video },
+  });
+  const cards = [makeCard(false), makeCard(true), makeCard(true)];
+  const root = {
+    querySelectorAll(selector) {
+      assert.equal(selector, '.bdf-hidden-dynamic');
+      return cards;
+    },
+  };
 
-  assert.equal(togglePreviewMode('none', 'all'), 'all');
-  assert.equal(togglePreviewMode('video', 'all'), 'all');
-  assert.equal(togglePreviewMode('all', 'all'), 'none');
-  assert.equal(togglePreviewMode('video', 'video'), 'none');
+  assert.deepEqual(Array.from(getBlockedPreviewCards(root, 'all')), cards);
+  assert.deepEqual(Array.from(getBlockedPreviewCards(root, 'video')), cards.slice(1));
 });
 
 test('restores a missing preview highlight after a same-text rerender', () => {

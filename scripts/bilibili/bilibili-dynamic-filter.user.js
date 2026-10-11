@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         哔哩哔哩动态关键字屏蔽
 // @namespace    https://github.com/BlackCCCat/TampermonkeyScripts
-// @version      0.6.1
+// @version      0.7.0
 // @description  通过关键字或正则表达式屏蔽哔哩哔哩动态，并支持动态加载内容。
 // @author       BlackCCCat
 // @license      MIT
@@ -35,6 +35,8 @@
     compact: false,
     position: null,
   });
+  const HIDDEN_CLASS = 'bdf-hidden-dynamic';
+  const VIDEO_MATCH_CLASS = 'bdf-matched-video-dynamic';
   const CONFIG_KEY = 'bilibili-dynamic-filter:config:v1';
   const UI_STATE_KEY = 'bilibili-dynamic-filter:ui:v1';
   const VIDEO_CONTENT_SELECTORS = [
@@ -314,8 +316,11 @@
     return 'none';
   }
 
-  function togglePreviewMode(currentMode, targetMode) {
-    return currentMode === targetMode ? 'none' : targetMode;
+  function getBlockedPreviewCards(root, mode) {
+    const cards = Array.from(root.querySelectorAll(`.${HIDDEN_CLASS}`));
+    return mode === 'video'
+      ? cards.filter((card) => card.classList.contains(VIDEO_MATCH_CLASS))
+      : cards;
   }
 
   function shouldShowStatusPanel(currentConfig, ruleCount) {
@@ -754,6 +759,7 @@
       findMatchRanges,
       formatRulesText,
       formatStatusText,
+      getBlockedPreviewCards,
       groupRuleEntries,
       highlightPiecesEqual,
       isVideoDynamic,
@@ -771,7 +777,6 @@
       resolvePreviewMode,
       shouldHideMatchedCard,
       shouldShowStatusPanel,
-      togglePreviewMode,
       updateStoredConfig,
       videoSelector: VIDEO_SELECTOR,
     };
@@ -783,14 +788,13 @@
     '.bili-dyn-item',
     '[data-did]',
   ].join(',');
-  const HIDDEN_CLASS = 'bdf-hidden-dynamic';
-  const VIDEO_MATCH_CLASS = 'bdf-matched-video-dynamic';
   const PREVIEW_CLASS = 'bdf-show-blocked-content';
   const VIDEO_PREVIEW_CLASS = 'bdf-show-blocked-videos';
+  const PREVIEW_TARGET_CLASS = 'bdf-preview-target';
   const HIGHLIGHT_SELECTOR = '[data-bdf-match-highlight]';
   const QUICK_BLOCK_SELECTOR = '[data-bdf-quick-block]';
   const QUICK_BLOCK_HOST_CLASS = 'bdf-quick-block-host';
-  const OWNED_UI_SELECTOR = `#bdf-status, #bdf-overlay, #bdf-quick-block-overlay, ${QUICK_BLOCK_SELECTOR}`;
+  const OWNED_UI_SELECTOR = `#bdf-status, #bdf-overlay, #bdf-quick-block-overlay, #bdf-list-overlay, ${QUICK_BLOCK_SELECTOR}`;
 
   let config = normalizeConfig(DEFAULT_CONFIG);
   let uiState = normalizeUiState(DEFAULT_UI_STATE);
@@ -798,6 +802,7 @@
   let configRevision = 0;
   let pendingTimer;
   let previewMode = 'none';
+  let previewTarget = null;
   let statusPanel;
   let statusCount;
   let compactHiddenCount;
@@ -810,6 +815,7 @@
   let suppressCompactClick = false;
   let closeConfigDialog = null;
   let closeQuickBlockDialog = null;
+  let closeBlockedListDialog = null;
   const pendingRoots = new Set();
   const cardState = new WeakMap();
 
@@ -1264,29 +1270,7 @@
       compactToggle.setAttribute('aria-label', compactLabel);
     }
     previewButton.disabled = hiddenCount === 0;
-    const previewText = previewMode === 'all' ? '恢复屏蔽' : '查看全部';
-    if (previewButton.textContent !== previewText) previewButton.textContent = previewText;
-    previewButton.setAttribute(
-      'aria-label',
-      previewMode === 'all' ? '恢复动态屏蔽' : '查看全部屏蔽内容',
-    );
-    const pressed = String(previewMode === 'all');
-    if (previewButton.getAttribute('aria-pressed') !== pressed) {
-      previewButton.setAttribute('aria-pressed', pressed);
-    }
     videoPreviewButton.hidden = hiddenVideoCount === 0;
-    const videoPreviewText = previewMode === 'video' ? '恢复屏蔽' : '仅看视频';
-    if (videoPreviewButton.textContent !== videoPreviewText) {
-      videoPreviewButton.textContent = videoPreviewText;
-    }
-    videoPreviewButton.setAttribute(
-      'aria-label',
-      previewMode === 'video' ? '恢复视频动态屏蔽' : '仅查看被屏蔽的视频动态',
-    );
-    const videoPressed = String(previewMode === 'video');
-    if (videoPreviewButton.getAttribute('aria-pressed') !== videoPressed) {
-      videoPreviewButton.setAttribute('aria-pressed', videoPressed);
-    }
     if (panelVisible && (wasHidden || (uiState.compact && compactStatsChanged))) {
       requestAnimationFrame(applyStatusPanelPosition);
     }
@@ -1294,6 +1278,10 @@
 
   function setBlockedContentPreview(mode, refreshStats = true) {
     previewMode = mode;
+    if (mode === 'none') {
+      previewTarget?.classList.remove(PREVIEW_TARGET_CLASS);
+      previewTarget = null;
+    }
     document.documentElement.classList.toggle(PREVIEW_CLASS, previewMode === 'all');
     document.documentElement.classList.toggle(
       VIDEO_PREVIEW_CLASS,
@@ -1301,6 +1289,82 @@
     );
     syncMatchHighlights();
     if (refreshStats) updateStats();
+  }
+
+  function openBlockedListDialog(mode) {
+    closeBlockedListDialog?.();
+    const cards = getBlockedPreviewCards(document, mode);
+    if (cards.length === 0) return;
+
+    const previousFocus = document.activeElement;
+    const overlay = document.createElement('div');
+    overlay.id = 'bdf-list-overlay';
+    overlay.innerHTML = `
+      <section id="bdf-list-dialog" role="dialog" aria-modal="true" aria-labelledby="bdf-list-title">
+        <div class="bdf-list-header">
+          <h2 id="bdf-list-title"></h2>
+          <button type="button" data-action="close" aria-label="关闭列表">×</button>
+        </div>
+        <ol id="bdf-blocked-list"></ol>
+        <p id="bdf-list-message" aria-live="polite"></p>
+        <div class="bdf-actions">
+          <button type="button" data-action="restore" hidden>恢复屏蔽</button>
+        </div>
+      </section>
+    `;
+    overlay.querySelector('#bdf-list-title').textContent = `${mode === 'video' ? '已屏蔽视频' : '已屏蔽动态'}（${cards.length}）`;
+    const list = overlay.querySelector('#bdf-blocked-list');
+    const message = overlay.querySelector('#bdf-list-message');
+    const close = () => {
+      document.removeEventListener('keydown', handleKeydown);
+      overlay.remove();
+      if (closeBlockedListDialog === close) closeBlockedListDialog = null;
+      previousFocus?.focus?.();
+    };
+    const handleKeydown = (event) => {
+      if (event.key === 'Escape') close();
+    };
+
+    cards.forEach((card, index) => {
+      const item = document.createElement('li');
+      const button = document.createElement('button');
+      const label = document.createElement('strong');
+      const excerpt = document.createElement('span');
+      button.type = 'button';
+      label.textContent = `${card.classList.contains(VIDEO_MATCH_CLASS) ? '视频' : '动态'} ${index + 1}`;
+      const text = extractCardText(card);
+      excerpt.textContent = text ? `${text.slice(0, 120)}${text.length > 120 ? '…' : ''}` : '无文字内容';
+      button.append(label, excerpt);
+      button.addEventListener('click', () => {
+        if (!card.isConnected || !card.classList.contains(HIDDEN_CLASS)) {
+          message.textContent = '这条动态已不在当前页面，请重新打开列表';
+          return;
+        }
+        close();
+        setBlockedContentPreview(mode);
+        previewTarget?.classList.remove(PREVIEW_TARGET_CLASS);
+        previewTarget = card;
+        card.classList.add(PREVIEW_TARGET_CLASS);
+        card.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+      item.append(button);
+      list.append(item);
+    });
+
+    const restoreButton = overlay.querySelector('[data-action="restore"]');
+    restoreButton.hidden = previewMode === 'none';
+    restoreButton.addEventListener('click', () => {
+      setBlockedContentPreview('none');
+      close();
+    });
+    overlay.querySelector('[data-action="close"]').addEventListener('click', close);
+    overlay.addEventListener('click', (event) => {
+      if (event.target === overlay) close();
+    });
+    closeBlockedListDialog = close;
+    document.addEventListener('keydown', handleKeydown);
+    document.body.append(overlay);
+    list.querySelector('button')?.focus();
   }
 
   function setStatusPanelPosition(position) {
@@ -1447,8 +1511,8 @@
           <button type="button" class="bdf-collapse" data-action="collapse" aria-label="缩小状态面板" title="缩小">−</button>
         </div>
         <div class="bdf-status-actions">
-          <button type="button" data-action="preview" aria-label="查看全部屏蔽内容" aria-pressed="false">查看全部</button>
-          <button type="button" data-action="preview-video" aria-label="仅查看被屏蔽的视频动态" aria-pressed="false" hidden>仅看视频</button>
+          <button type="button" data-action="preview" aria-label="查看全部屏蔽内容">查看全部</button>
+          <button type="button" data-action="preview-video" aria-label="仅查看被屏蔽的视频动态" hidden>仅看视频</button>
           <button type="button" data-action="config">配置</button>
         </div>
       </div>
@@ -1465,10 +1529,10 @@
     previewButton = statusPanel.querySelector('[data-action="preview"]');
     videoPreviewButton = statusPanel.querySelector('[data-action="preview-video"]');
     previewButton.addEventListener('click', () => {
-      setBlockedContentPreview(togglePreviewMode(previewMode, 'all'));
+      openBlockedListDialog('all');
     });
     videoPreviewButton.addEventListener('click', () => {
-      setBlockedContentPreview(togglePreviewMode(previewMode, 'video'));
+      openBlockedListDialog('video');
     });
     statusPanel.querySelector('[data-action="config"]').addEventListener('click', openConfigDialog);
     statusPanel.querySelector('[data-action="collapse"]').addEventListener('click', () => {
@@ -1651,6 +1715,10 @@
       html.${VIDEO_PREVIEW_CLASS} .${HIDDEN_CLASS}.${VIDEO_MATCH_CLASS}::before {
         content: "已屏蔽的视频动态"; background: #00aeec;
       }
+      html.${PREVIEW_CLASS} .${PREVIEW_TARGET_CLASS},
+      html.${VIDEO_PREVIEW_CLASS} .${PREVIEW_TARGET_CLASS} {
+        outline: 3px solid #00aeec; outline-offset: 4px;
+      }
       ${HIGHLIGHT_SELECTOR} {
         color: #d83a52 !important; background: transparent; pointer-events: none;
       }
@@ -1719,23 +1787,29 @@
       }
       .bdf-status-actions [data-action="config"] { color: #fff; background: #00aeec; }
       .bdf-status-actions [data-action="config"]:hover { background: #009bd3; }
-      .bdf-status-actions [data-action="preview"][aria-pressed="true"] {
-        border-color: #fb7299; color: #fff; background: #fb7299;
-      }
-      .bdf-status-actions [data-action="preview-video"][aria-pressed="true"] {
-        color: #fff; background: #00aeec;
-      }
-      #bdf-overlay, #bdf-quick-block-overlay {
+      #bdf-overlay, #bdf-quick-block-overlay, #bdf-list-overlay {
         position: fixed; inset: 0; z-index: 99999; display: grid; place-items: center;
         padding: 20px; background: rgb(0 0 0 / 45%); color: #18191c;
       }
-      #bdf-dialog, #bdf-quick-block-dialog {
+      #bdf-dialog, #bdf-quick-block-dialog, #bdf-list-dialog {
         color-scheme: light;
         width: min(560px, 100%); box-sizing: border-box; padding: 22px;
         border-radius: 14px; background: #fff; box-shadow: 0 16px 48px rgb(0 0 0 / 24%);
         font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       }
       #bdf-quick-block-dialog { width: min(420px, 100%); }
+      #bdf-list-dialog { display: flex; flex-direction: column; max-height: calc(100vh - 40px); }
+      .bdf-list-header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+      .bdf-list-header h2 { margin: 0; font-size: 20px; }
+      .bdf-list-header button { border: 0; color: inherit; background: transparent; cursor: pointer; font: 24px/1 sans-serif; }
+      #bdf-blocked-list { min-height: 0; overflow-y: auto; margin: 16px 0 0; padding: 0; list-style: none; }
+      #bdf-blocked-list li + li { border-top: 1px solid #e3e5e7; }
+      #bdf-blocked-list button { display: block; width: 100%; border: 0; border-radius: 7px; padding: 10px; color: inherit; background: transparent; text-align: left; cursor: pointer; font: inherit; }
+      #bdf-blocked-list button:hover, #bdf-blocked-list button:focus-visible { background: #f1f7fa; }
+      #bdf-blocked-list strong { display: block; margin-bottom: 3px; color: #fb7299; }
+      #bdf-blocked-list span { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow-wrap: anywhere; }
+      #bdf-list-message { margin: 8px 0 0; color: #d83a52; }
+      #bdf-list-message:empty { display: none; }
       #bdf-dialog h2, #bdf-quick-block-dialog h2 { margin: 0 0 16px; font-size: 20px; }
       #bdf-dialog label, #bdf-quick-block-dialog label { display: block; margin: 10px 0 6px; font-weight: 600; }
       #bdf-dialog .bdf-switch-row { display: flex; gap: 8px; align-items: center; font-weight: 400; }
@@ -1753,8 +1827,10 @@
       .bdf-actions button { border: 1px solid #c9ccd0; border-radius: 8px; padding: 7px 14px; background: #fff; cursor: pointer; }
       .bdf-actions .bdf-primary { border-color: #00aeec; color: #fff; background: #00aeec; }
       @media (prefers-color-scheme: dark) {
-        #bdf-status, #bdf-dialog, #bdf-rules, #bdf-quick-block-dialog, #bdf-quick-block-input { color: #e3e5e7; background: #242628; }
-        #bdf-dialog, #bdf-quick-block-dialog { color-scheme: dark; }
+        #bdf-status, #bdf-dialog, #bdf-rules, #bdf-quick-block-dialog, #bdf-quick-block-input, #bdf-list-dialog { color: #e3e5e7; background: #242628; }
+        #bdf-dialog, #bdf-quick-block-dialog, #bdf-list-dialog { color-scheme: dark; }
+        #bdf-blocked-list li + li { border-color: #55585c; }
+        #bdf-blocked-list button:hover, #bdf-blocked-list button:focus-visible { background: #333538; }
         #bdf-status { border-color: #55585c; }
         #bdf-status.bdf-compact { background: rgb(36 38 40 / 94%); }
         .bdf-collapse { color: #aeb3b8; background: #333538; }
