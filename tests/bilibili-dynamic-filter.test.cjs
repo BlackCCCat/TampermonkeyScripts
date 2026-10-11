@@ -495,6 +495,21 @@ test('blocked-content list follows page order and limits the video view to hidde
   assert.deepEqual(Array.from(getBlockedPreviewCards(root, 'video')), cards.slice(1));
 });
 
+test('a single restored block stays hidden in preview until selected again', () => {
+  const { isCardVisibleInPreview } = loadTestApi();
+  const classes = new Set(['bdf-hidden-dynamic', 'bdf-matched-video-dynamic']);
+  const card = { classList: { contains: (name) => classes.has(name) } };
+
+  assert.equal(isCardVisibleInPreview(card, 'all'), true);
+  assert.equal(isCardVisibleInPreview(card, 'video'), true);
+  classes.add('bdf-preview-dismissed');
+  assert.equal(isCardVisibleInPreview(card, 'all'), false);
+  assert.equal(isCardVisibleInPreview(card, 'video'), false);
+  classes.delete('bdf-preview-dismissed');
+  assert.equal(isCardVisibleInPreview(card, 'video'), true);
+  assert.equal(isCardVisibleInPreview(card, 'none'), false);
+});
+
 test('restores a missing preview highlight after a same-text rerender', () => {
   const { highlightPiecesEqual, resolveHighlightAction } = loadTestApi();
 
